@@ -391,13 +391,6 @@ Disconnect          →  WS close frame + TCP close
 
 ## Performance
 
-| Operation | Throughput | Memory |
-|-----------|:---:|:---:|
-| Download (localhost) | 175+ MB/s | ~64 KB |
-| Download (internet) | Limited by bandwidth | ~64 KB |
-| Upload (localhost) | 115+ MB/s | ~64 KB |
-| Upload (internet) | Limited by bandwidth | ~64 KB |
-
 All file transfers use streaming I/O with 64KB chunks. Files are never loaded entirely into memory.
 
 ## Changelog
