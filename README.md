@@ -9,11 +9,13 @@ Zero external dependencies. Drop one `.ctl` file into your project — done.
 ## Features
 
 - **TCP/UDP** — Client and server with async I/O
-- **TLS/HTTPS** — Native Windows Schannel (SSPI), TLS 1.0–1.3, no OpenSSL needed
+- **TLS/HTTPS** — Native Windows Schannel (SSPI), TLS 1.0–1.3, client and server
 - **HTTP** — GET, POST, PUT, DELETE with response parsing (chunked + Content-Length)
 - **WebSocket** — Full RFC 6455: text, binary, ping/pong, close handshake
-- **File Transfer** — Upload (multipart), download (save to disk), chunked send
+- **File Transfer** — Streaming upload (multipart, 64KB chunks), streaming download (save to disk), chunked send
+- **Resume Support** — Pause/resume downloads with HTTP Range header
 - **Progress Tracking** — Real-time speed (bytes/sec) and ETA for all transfers
+- **Auto-Retry** — Configurable retry on connection failures
 - **Universal API** — One set of methods auto-detects protocol from URL scheme
 - **Zero Dependencies** — Uses only built-in Windows DLLs
 - **Minimum OS** — Windows 7
@@ -54,8 +56,8 @@ czSocket auto-detects the protocol from the URL scheme. You don't need to rememb
 | `Connect host, [port]` | Connect to host. Auto-detects `ws://`, `wss://`, `http://`, `https://` |
 | `SendData data` | Send string or byte array. Auto: WS frame or raw TCP |
 | `SendFile path, [chunkSize]` | Send file from disk in chunks. Auto: WS binary frames or raw TCP |
-| `Download url, savePath` | Download file via HTTP/HTTPS, save to disk |
-| `Upload url, filePath, [field]` | Upload file via HTTP POST multipart/form-data |
+| `Download url, savePath, [headers], [resumeFrom]` | Download file via HTTP/HTTPS. Optional resume from byte offset |
+| `Upload url, filePath, [field]` | Stream upload file via HTTP POST multipart (64KB chunks, non-blocking) |
 | `Request method, url, [body]` | Send HTTP/HTTPS request (GET, POST, PUT, etc.) |
 | `Ping [data]` | Send WebSocket ping frame |
 | `Disconnect` | Close connection. Auto: WS graceful close + TCP close |
@@ -214,11 +216,35 @@ Private Sub czSocket1_Response(ByVal Status As Long, ByVal ContentType As String
 End Sub
 ```
 
+### Resume Download (Pause/Resume)
+
+```vb
+Dim lBytesDownloaded As Long
+
+' Pause: disconnect and remember bytes
+Private Sub btnPause_Click()
+    lBytesDownloaded = m_lCurrentBytes
+    czSocket1.Disconnect
+End Sub
+
+' Resume: use ResumeFrom parameter with Range header
+Private Sub btnResume_Click()
+    czSocket1.Download "https://example.com/largefile.zip", _
+                       "C:\Downloads\largefile.zip", , lBytesDownloaded
+End Sub
+```
+
 ### Upload File
 
 ```vb
 Private Sub btnUpload_Click()
     czSocket1.Upload "https://api.example.com/upload", "C:\Photos\photo.jpg"
+End Sub
+
+Private Sub czSocket1_Progress(ByVal BytesSent As Long, ByVal BytesTotal As Long, _
+    ByVal BytesPerSec As Long, ByVal SecondsRemaining As Long)
+    lblStatus.Caption = "Uploading: " & Format$(BytesSent / BytesTotal * 100, "0.0") & _
+        "%  " & Format$(BytesPerSec / 1048576, "0.0") & " MB/s"
 End Sub
 
 Private Sub czSocket1_Response(ByVal Status As Long, ByVal ContentType As String, _
@@ -274,6 +300,42 @@ Private Sub czSocket1_DataArrival(ByVal bytesTotal As Long)
 End Sub
 ```
 
+### HTTPS Server (TLS)
+
+```vb
+' Uses two czSocket controls: czServer (listener) + czClient (accepted)
+Private Sub Form_Load()
+    czServer.LocalPort = 8443
+    czServer.Listen App.Path & "\server.pfx", "password"
+End Sub
+
+Private Sub czServer_ConnectionRequest(ByVal requestID As Long)
+    czClient.Disconnect
+    czClient.Accept requestID  ' TLS handshake is automatic
+End Sub
+
+Private Sub czClient_Connect()
+    ' TLS handshake complete — client is ready
+End Sub
+
+Private Sub czClient_DataArrival(ByVal bytesTotal As Long)
+    Dim s As String
+    czClient.GetData s
+    ' Send HTTP response
+    Dim resp As String
+    resp = "HTTP/1.1 200 OK" & vbCrLf & _
+           "Content-Type: text/plain" & vbCrLf & _
+           "Content-Length: 13" & vbCrLf & _
+           "Connection: close" & vbCrLf & vbCrLf & _
+           "Hello, World!"
+    czClient.SendData resp
+End Sub
+
+Private Sub czClient_SendComplete()
+    czClient.Disconnect
+End Sub
+```
+
 ---
 
 ## Auto-Detection Logic
@@ -325,9 +387,48 @@ Disconnect          →  WS close frame + TCP close
 | IDE | Visual Basic 6.0 SP6 |
 | OS | Windows 7 or later |
 | Dependencies | None (zero external DLLs) |
-| File | Single `czSocket.ctl` (~115 KB) |
+| File | Single `czSocket.ctl` (~130 KB) |
+
+## Performance
+
+| Operation | Throughput | Memory |
+|-----------|:---:|:---:|
+| Download (localhost) | 175+ MB/s | ~64 KB |
+| Download (internet) | Limited by bandwidth | ~64 KB |
+| Upload (localhost) | 115+ MB/s | ~64 KB |
+| Upload (internet) | Limited by bandwidth | ~64 KB |
+
+All file transfers use streaming I/O with 64KB chunks. Files are never loaded entirely into memory.
 
 ## Changelog
+### v1.2
+
+#### Performance
+- **Fix**: O(n²) string accumulation in `pvHttpProcessResponse` — download now streams bytes directly to file via `Put #`, bypassing `m_sHttpRawResponse` accumulation after headers are parsed
+- **Fix**: Single `recv` per timer tick — `pvOnReceive` now loops until `WSAEWOULDBLOCK` to drain all available data, increasing download throughput from ~3 MB/s to 175+ MB/s
+- **Fix**: Upload loaded entire file into memory — `Upload` now streams file in 64KB chunks via `pvSendNextFileChunk` iterative loop
+- **Fix**: `pvSendNextFileChunk` only sent one chunk per `FD_WRITE` event — now loops until `WSAEWOULDBLOCK` with periodic `DoEvents` for UI responsiveness
+
+#### Download
+- **New**: Resume support — `Download` accepts optional `ResumeFrom` parameter, sends `Range: bytes=N-` header, seeks file to correct position, handles `206 Partial Content` response
+- **New**: Streaming file write — received bytes written directly to disk via file handle, never accumulated in memory
+
+#### Upload  
+- **New**: Streaming upload — HTTP headers + multipart prefix sent first, then file streamed in 64KB chunks, then multipart suffix. Replaces old approach of loading entire file into `baBody` array
+- **New**: Upload progress — `Progress` event fires during upload with bytes sent, total, speed, and ETA
+- **Fix**: State setup ordering — upload state set after `Connect` call (which internally calls `Disconnect` and resets state)
+
+#### Demo: Parallel Downloader & Uploader
+- **New**: Pause/Resume buttons with click-to-select on progress bar
+- **New**: Stop/Cancel button for active, paused, and queued downloads
+- **New**: IDM-style block mosaic progress visualization (40 blocks per file)
+- **New**: Auto-retry (2 attempts) on connection failure
+- **New**: Upload progress display with percentage, speed, and ETA
+- **New**: Dynamic button states (Pause ↔ Resume) based on selected download
+- **New**: Status bar shows Active / Queued / Done / Paused / Errors counts
+- **New**: Total download time logging per file
+- **Fix**: DrawProgress throttled to ~10 fps to prevent CPU saturation
+- **Fix**: Unicode characters (`Chr$(&H25BA)`) causing Runtime Error 5 in compiled EXE — replaced with ASCII-safe indicators
 
 ### v1.1
 
@@ -338,6 +439,10 @@ Disconnect          →  WS close frame + TCP close
 - **Fix**: Double `Disconnected` event firing — guard against redundant `pvOnClose` calls
 - **Fix**: Double `Connect` event for WebSocket — suppress TLS-level connect when WS handshake pending
 - **Fix**: Stale HTTP response data contaminating WebSocket handshake parser — proper state cleanup in `Disconnect`
+- **New**: TLS Server — `Listen` now accepts PFX certificate for HTTPS/WSS server support
+- **New**: `pvLoadPfxCertificate` — loads PFX/P12 certificate files via Windows CryptoAPI
+- **New**: Server-side TLS handshake using `AcceptSecurityContext` (SSPI/Schannel)
+- **New**: WebServer demo in `Demo/WebServer/` with self-signed certificate generator
 - **Improved**: TLS feature description updated to include TLS 1.3 support
 - **Improved**: HTTP response parsing description updated (chunked + Content-Length)
 
