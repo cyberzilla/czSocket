@@ -717,14 +717,60 @@ End Sub
 
 Private Sub czUpload_Response(ByVal Status As Long, ByVal ContentType As String, Body As String, Headers As String)
     btnUpload.Enabled = True
+    Log "< HTTP " & Status & " (" & ContentType & ")"
+    Log "< " & Left$(Body, 300)
     If Status >= 200 And Status < 300 Then
-        lblUploadStatus.Caption = "Upload OK! (HTTP " & Status & ")"
-        lblUploadStatus.ForeColor = &HAA00&
-        Log "* Upload complete! Response: " & Left$(Body, 200)
+        '--- Try JSON parse if content type indicates JSON
+        If InStr(1, ContentType, "json", vbTextCompare) > 0 And Len(Body) > 0 Then
+            czUpload.JsonParse Body
+            '--- Check if parsing actually succeeded (JsonHas returns False if m_oJsonRoot is Nothing)
+            If czUpload.JsonHas("success") Then
+                If czUpload.JsonBool("success") Then
+                    lblUploadStatus.Caption = "Upload OK! Server: " & czUpload.JsonStr("server")
+                    lblUploadStatus.ForeColor = &HAA00&
+                    Log ""
+                    Log "  [JSON Parsed]"
+                    Log "    success   = " & czUpload.JsonStr("success")
+                    Log "    server    = " & czUpload.JsonStr("server")
+                    Log "    timestamp = " & czUpload.JsonStr("timestamp")
+                    '--- Show uploaded file details
+                    If czUpload.JsonHas("files") Then
+                        Dim vFileKeys As Variant, j As Long
+                        vFileKeys = czUpload.JsonGetKeys("files")
+                        If IsArray(vFileKeys) Then
+                            If UBound(vFileKeys) >= 0 Then
+                                For j = 0 To UBound(vFileKeys)
+                                    Dim sPrefix As String
+                                    sPrefix = "files/" & j
+                                    Log "    --- File #" & j + 1 & " ---"
+                                    Log "      name = " & czUpload.JsonStr(sPrefix & "/name")
+                                    Log "      size = " & czUpload.JsonStr(sPrefix & "/size_human")
+                                    Log "      type = " & czUpload.JsonStr(sPrefix & "/type")
+                                    Log "      path = " & czUpload.JsonStr(sPrefix & "/path")
+                                Next j
+                            End If
+                        End If
+                    End If
+                Else
+                    '--- Server explicitly returned success=false
+                    lblUploadStatus.Caption = "Server error: " & czUpload.JsonStr("error")
+                    lblUploadStatus.ForeColor = vbRed
+                    Log "! Server returned success=false: " & czUpload.JsonStr("error")
+                End If
+            Else
+                '--- JSON parse failed (m_oJsonRoot is Nothing) - fall back to raw display
+                lblUploadStatus.Caption = "Upload OK! (HTTP " & Status & ") - JSON parse failed"
+                lblUploadStatus.ForeColor = &HAA00&
+                Log "! Note: JSON parse failed, raw body shown above"
+            End If
+        Else
+            lblUploadStatus.Caption = "Upload OK! (HTTP " & Status & ")"
+            lblUploadStatus.ForeColor = &HAA00&
+        End If
     Else
         lblUploadStatus.Caption = "Failed: HTTP " & Status
         lblUploadStatus.ForeColor = vbRed
-        Log "! Upload failed: HTTP " & Status & " - " & Left$(Body, 200)
+        Log "! Upload failed: HTTP " & Status
     End If
 End Sub
 

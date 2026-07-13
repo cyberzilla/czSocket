@@ -223,8 +223,40 @@ End Sub
 Private Sub czSocket1_Response(ByVal Status As Long, ByVal ContentType As String, _
     Body As String, Headers As String)
     Log "< HTTP " & Status & " (" & ContentType & ")"
-    Log "< " & Left$(Body, 500)
-    If Len(Body) > 500 Then Log "  ... (" & Len(Body) & " bytes total)"
+    '--- JSON response? Parse it!
+    If InStr(1, ContentType, "json", vbTextCompare) > 0 And Len(Body) > 0 Then
+        czSocket1.JsonParse Body
+        '--- Check if parsing succeeded
+        Dim vKeys As Variant
+        vKeys = czSocket1.JsonGetKeys()
+        If IsArray(vKeys) Then
+            If UBound(vKeys) >= 0 Then
+                Log ""
+                Log "  [JSON Parsed]"
+                Dim i As Long
+                For i = 0 To UBound(vKeys)
+                    Dim sKey As String
+                    sKey = CStr(vKeys(i))
+                    Dim sVal As String
+                    sVal = czSocket1.JsonStr(sKey)
+                    If Len(sVal) > 80 Then sVal = Left$(sVal, 80) & "..."
+                    Log "    " & sKey & " = " & sVal
+                Next i
+                Log ""
+                Log "  [Pretty Print]"
+                Log czSocket1.JsonDumpPretty(2)
+            Else
+                Log "< " & Left$(Body, 500)
+                Log "! Note: JSON parse returned no keys"
+            End If
+        Else
+            Log "< " & Left$(Body, 500)
+            Log "! Note: JSON parse failed"
+        End If
+    Else
+        Log "< " & Left$(Body, 500)
+        If Len(Body) > 500 Then Log "  ... (" & Len(Body) & " bytes total)"
+    End If
     lblStatus.Caption = "HTTP " & Status & " received"
     lblStatus.ForeColor = IIf(Status = 200, &H8000&, vbRed)
 End Sub

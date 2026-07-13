@@ -133,6 +133,30 @@ Attribute VB_Exposed = False
 '   Ping [Data]
 '       Sends a WebSocket ping frame (only when connected via ws/wss).
 '
+' METHODS (JSON Engine):
+'   JsonParse(sJsonText) As czSocket
+'       Parse JSON string. Returns Me for method chaining.
+'       Example: czSocket1.JsonParse(Body).JsonStr("name")
+'
+'   JsonParseObject(sJsonText) As Object
+'       Stateless parse. Returns Collection (no caching).
+'
+'   JsonStr(sPath) As String     — Get value as String via path.
+'   JsonLng(sPath) As Long       — Get value as Long via path.
+'   JsonDbl(sPath) As Double     — Get value as Double via path.
+'   JsonBool(sPath) As Boolean   — Get value as Boolean via path.
+'   JsonObj(sPath) As Object     — Get sub-object (Collection).
+'   JsonGet(sPath) As Variant    — Get value as Variant via path.
+'   JsonHas(sPath) As Boolean    — Check if key/path exists.
+'   JsonGetKeys([sPath]) As Variant — List keys at path.
+'
+'   JsonSet(sPath, vValue)       — Set/modify value. Auto-create parents.
+'   JsonRemove(sPath)            — Remove key/element from JSON.
+'
+'   JsonDump([Minimize]) As String       — Serialize to JSON string.
+'   JsonDumpPretty([IndentSize]) As String — Pretty-print JSON.
+'   JsonClose()                  — Clear cached JSON data.
+'
 ' EVENTS:
 '   Connect()
 '       Fired when connection is established (TCP, TLS, or WS handshake).
@@ -426,6 +450,10 @@ Private Declare Function CryptReleaseContext Lib "advapi32" (ByVal hProv As Long
 Private Declare Function CryptGenRandom Lib "advapi32" (ByVal hProv As Long, ByVal dwLen As Long, pbBuffer As Any) As Long
 Private Declare Function CryptBinaryToStringA Lib "crypt32" (ByVal pbBinary As Long, ByVal cbBinary As Long, ByVal dwFlags As Long, ByVal pszString As Long, pcchString As Long) As Long
 
+'--- JSON Engine ---
+Private Declare Function ArrPtr Lib "msvbvm60" Alias "VarPtr" (Ptr() As Any) As Long
+Private Declare Function VariantChangeType Lib "oleaut32" (Dest As Variant, Src As Variant, ByVal wFlags As Integer, ByVal vt As VbVarType) As Long
+
 '--- Certificate / PFX store
 Private Declare Function PFXImportCertStore Lib "crypt32" (pPFX As Any, ByVal szPassword As Long, ByVal dwFlags As Long) As Long
 Private Declare Function CertFindCertificateInStore Lib "crypt32" (ByVal hCertStore As Long, ByVal dwCertEncodingType As Long, ByVal dwFindFlags As Long, ByVal dwFindType As Long, ByVal pvFindPara As Long, ByVal pPrevCertContext As Long) As Long
@@ -494,6 +522,41 @@ Private Type WSANETWORKEVENTS_TYPE
     lNetworkEvents  As Long
     iErrorCode(0 To 9) As Long
 End Type
+
+'--- JSON Engine Types, Enum & Constants ---
+Private Type SAFEARRAY1D
+    cDims               As Integer
+    fFeatures           As Integer
+    cbElements          As Long
+    cLocks              As Long
+    pvData              As Long
+    cElements           As Long
+    lLbound             As Long
+End Type
+
+Private Type JsonContext
+    StrictMode          As Boolean
+    Text()              As Integer
+    Pos                 As Long
+    Error               As String
+    LastChar            As Integer
+    TextArray           As SAFEARRAY1D
+End Type
+
+Private Enum VbCollectionOffsets
+    o_pFirstIndexedItem = &H18
+    o_pRootTreeItem = &H24
+    o_pEndTreePtr = &H28
+    o_pvUnk5 = &H2C
+    o_KeyPtr = &H10
+    o_pNextIndexedItem = o_pFirstIndexedItem
+    o_pRightBranch = &H24
+    o_pLeftBranch = &H28
+End Enum
+
+Private Const JSON_IDX_OFFSET      As Long = 1
+Private Const JSON_VARIANT_ALPHABOOL As Long = 2
+Private Const JSON_DEF_IGNORE_CASE As Boolean = True
 
 '=========================================================================
 ' Constants
@@ -730,6 +793,9 @@ Private m_lCertStore            As Long     '--- Handle to certificate store
 Private m_sCertFile             As String   '--- Path to PFX file (from Listen)
 Private m_sCertPassword         As String   '--- PFX password
 Private m_sCertSubject          As String   '--- Cert subject filter
+
+'--- JSON Engine Cache ---
+Private m_oJsonRoot As Object
 
 '=========================================================================
 ' Error handling
@@ -1418,6 +1484,13 @@ Public Sub Upload(Url As String, FilePath As String, _
     Connect sHost, lPort
     '--- Now set state AFTER Connect (won't be reset because pvOnConnect fires later via timer)
     m_lHttpState = HTTP_WAITING
+    m_sHttpRawResponse = vbNullString
+    m_lHttpStatus = 0
+    m_sHttpHeaders = vbNullString
+    m_sHttpContentType = vbNullString
+    m_lHttpContentLength = -1
+    m_bHttpChunked = False
+    m_sHttpBody = vbNullString
     m_dTransferStart = Timer
     '--- Build and queue HTTP request header + prefix
     Dim sReq As String
@@ -1488,6 +1561,93 @@ Public Sub SendFile(FilePath As String, Optional ByVal ChunkSize As Long = 8192)
 EH:
     m_bSendingFile = False
     pvSetError LastDllError:=WSAGetLastError(), RaiseError:=True
+End Sub
+
+'=========================================================================
+' Public Methods - JSON Engine
+'=========================================================================
+
+Public Function JsonParse(ByVal sJsonText As String) As czSocket
+    JsonClose
+    If Len(sJsonText) > 0 Then
+        Set m_oJsonRoot = pvJsonDoParseObject(sJsonText)
+    End If
+    Set JsonParse = Me
+End Function
+
+Public Function JsonParseObject(ByVal sJsonText As String) As Object
+    Set JsonParseObject = pvJsonDoParseObject(sJsonText)
+End Function
+
+Public Property Get JsonGet(ByVal sPath As String) As Variant
+    If m_oJsonRoot Is Nothing Then Exit Property
+    pvJsonAssign JsonGet, pvJsonValueGet(m_oJsonRoot, sPath)
+End Property
+
+Public Function JsonStr(ByVal sPath As String) As String
+    If m_oJsonRoot Is Nothing Then Exit Function
+    JsonStr = pvJsonC_Str(pvJsonValueGet(m_oJsonRoot, sPath))
+End Function
+
+Public Function JsonLng(ByVal sPath As String) As Long
+    If m_oJsonRoot Is Nothing Then Exit Function
+    JsonLng = pvJsonC_Lng(pvJsonValueGet(m_oJsonRoot, sPath))
+End Function
+
+Public Function JsonDbl(ByVal sPath As String) As Double
+    If m_oJsonRoot Is Nothing Then Exit Function
+    JsonDbl = pvJsonC_Dbl(pvJsonValueGet(m_oJsonRoot, sPath))
+End Function
+
+Public Function JsonBool(ByVal sPath As String) As Boolean
+    If m_oJsonRoot Is Nothing Then Exit Function
+    JsonBool = pvJsonC_Bool(pvJsonValueGet(m_oJsonRoot, sPath))
+End Function
+
+Public Function JsonObj(ByVal sPath As String) As Object
+    If m_oJsonRoot Is Nothing Then Exit Function
+    Dim v As Variant
+    pvJsonAssign v, pvJsonValueGet(m_oJsonRoot, sPath)
+    If IsObject(v) Then Set JsonObj = v
+End Function
+
+Public Property Get JsonHas(ByVal sPath As String) As Boolean
+    If m_oJsonRoot Is Nothing Then Exit Property
+    Dim v As Variant
+    pvJsonAssign v, pvJsonValueGet(m_oJsonRoot, sPath)
+    JsonHas = Not IsEmpty(v)
+End Property
+
+Public Function JsonGetKeys(Optional ByVal sPath As String = "") As Variant
+    If m_oJsonRoot Is Nothing Then
+        JsonGetKeys = Array()
+        Exit Function
+    End If
+    JsonGetKeys = pvJsonKeys(m_oJsonRoot, sPath)
+End Function
+
+Public Sub JsonSet(ByVal sPath As String, ByVal vValue As Variant)
+    If m_oJsonRoot Is Nothing Then Set m_oJsonRoot = pvJsonCreateObject(vbBinaryCompare)
+    pvJsonValueLet m_oJsonRoot, sPath, vValue
+End Sub
+
+Public Sub JsonRemove(ByVal sPath As String)
+    If m_oJsonRoot Is Nothing Then Exit Sub
+    pvJsonValueLet m_oJsonRoot, sPath, Empty
+End Sub
+
+Public Function JsonDump(Optional ByVal Minimize As Boolean = False) As String
+    If m_oJsonRoot Is Nothing Then JsonDump = "{}": Exit Function
+    JsonDump = pvJsonDump(m_oJsonRoot, 0, Minimize)
+End Function
+
+Public Function JsonDumpPretty(Optional ByVal IndentSize As Long = 4) As String
+    If m_oJsonRoot Is Nothing Then JsonDumpPretty = "{}": Exit Function
+    JsonDumpPretty = pvJsonDump(m_oJsonRoot, 0, False, , IndentSize)
+End Function
+
+Public Sub JsonClose()
+    Set m_oJsonRoot = Nothing
 End Sub
 
 '=========================================================================
@@ -3465,6 +3625,599 @@ EH:
 End Sub
 
 '=========================================================================
+' JSON ENGINE (adapted from mdJson.bas by wqweto, improved by Cyberzilla)
+' Ported from CZStorageReader to czSocket
+' Original: https://gist.github.com/wqweto/e92dce63a68cd3ff9ca91b053b9510c9
+'=========================================================================
+
+Private Function pvJsonDoParseObject(sText As String) As Object
+    Dim vJson As Variant
+    Dim sError As String
+    If pvJsonDoParse(sText, vJson, sError) Then
+        If IsObject(vJson) Then
+            Set pvJsonDoParseObject = vJson
+        End If
+    End If
+    If Not sError = "" Then Debug.Print "JsonParse Error: " & sError
+End Function
+
+Private Function pvJsonDoParse(sText As String, Optional RetVal As Variant, Optional Error As String, _
+            Optional ByVal StrictMode As Boolean) As Boolean
+    Const FADF_AUTO     As Long = 1
+    Dim uCtx            As JsonContext
+
+    On Error GoTo EH
+    With uCtx
+        .StrictMode = StrictMode
+        With .TextArray
+            .cDims = 1
+            .fFeatures = FADF_AUTO
+            .cbElements = 2
+            .cLocks = 1
+            .pvData = StrPtr(sText)
+            If .pvData = 0 Then .pvData = StrPtr("")
+            .cElements = Len(sText) + 1
+        End With
+        CopyMemory ByVal ArrPtr(.Text), VarPtr(.TextArray), 4
+        pvJsonAssign RetVal, pvJsonParse(uCtx)
+        Error = .Error
+        If LenB(Error) <> 0 Then GoTo QH
+        If pvJsonGetChar(uCtx) <> 0 Then
+            Error = "Extra '" & ChrW$(.LastChar) & "' at position " & .Pos
+            GoTo QH
+        End If
+        pvJsonDoParse = True
+QH:
+        .TextArray.pvData = 0
+        .TextArray.cElements = 0
+        CopyMemory ByVal ArrPtr(.Text), 0&, 4
+    End With
+    Exit Function
+EH:
+    Error = "JsonParse: " & Err.Description
+    Debug.Print Error
+    Resume QH
+End Function
+
+Private Function pvJsonParse(uCtx As JsonContext) As Variant
+    Dim lIdx            As Long
+    Dim sKey            As String
+    Dim sText           As String
+    Dim vValue          As Variant
+    Dim oRetVal         As VBA.Collection
+
+    On Error GoTo EH
+    With uCtx
+        Select Case pvJsonGetChar(uCtx)
+        Case 34
+            pvJsonParse = pvJsonGetString(uCtx)
+            If .LastChar = 0 Then GoTo QH
+        Case 91
+            Set oRetVal = pvJsonCreateObject(vbTextCompare)
+            Do
+                pvJsonAssign vValue, pvJsonParse(uCtx)
+                If LenB(.Error) <> 0 Then
+                    If .LastChar = 93 Then
+                        If Not .StrictMode Then Exit Do
+                        lIdx = oRetVal.Count
+                        If lIdx = 0 Then Exit Do
+                    End If
+                    GoTo QH
+                End If
+                oRetVal.Add vValue
+                Select Case pvJsonGetChar(uCtx)
+                Case 44: lIdx = lIdx + 1
+                Case 93: Exit Do
+                Case Else
+                    .Error = "Expected ',' or ']' at position " & .Pos
+                    Exit Function
+                End Select
+            Loop
+            .Error = vbNullString
+            Set pvJsonParse = oRetVal
+        Case 123
+            Set oRetVal = pvJsonCreateObject(vbBinaryCompare)
+            Do
+                If pvJsonGetChar(uCtx) <> 34 Then
+                    If .LastChar = 125 Then
+                        If Not .StrictMode Then Exit Do
+                        lIdx = oRetVal.Count
+                        If lIdx = 0 Then Exit Do
+                    End If
+                    .Error = "Missing key at position " & .Pos
+                    GoTo QH
+                End If
+                sKey = pvJsonGetString(uCtx)
+                If .LastChar = 0 Then GoTo QH
+                If pvJsonGetChar(uCtx) <> 58 Then
+                    .Error = "Expected ':' at position " & .Pos
+                    GoTo QH
+                End If
+                pvJsonAssign vValue, pvJsonParse(uCtx)
+                If LenB(.Error) <> 0 Then GoTo QH
+                Select Case pvJsonGetChar(uCtx)
+                Case 44, 125
+                    If pvJsonCollIndexByKey(oRetVal, sKey, JSON_DEF_IGNORE_CASE) > 0 Then
+                        If .StrictMode Then
+                            .Error = "Duplicate key '" & sKey & "' at position " & .Pos
+                            GoTo QH
+                        End If
+                        oRetVal.Remove sKey
+                    End If
+                    oRetVal.Add vValue, sKey
+                    If .LastChar = 125 Then Exit Do
+                Case Else
+                    .Error = "Expected ',' or '}' at position " & .Pos
+                    GoTo QH
+                End Select
+            Loop
+            .Error = vbNullString
+            Set pvJsonParse = oRetVal
+        Case 116, 84
+            If (.Text(.Pos) Or &H20) <> 114 Then GoTo UnexpectedSymbol
+            If (.Text(.Pos + 1) Or &H20) <> 117 Then GoTo UnexpectedSymbol
+            If (.Text(.Pos + 2) Or &H20) <> 101 Then GoTo UnexpectedSymbol
+            .Pos = .Pos + 3
+            pvJsonParse = True
+        Case 102, 70
+            If (.Text(.Pos) Or &H20) <> 97 Then GoTo UnexpectedSymbol
+            If (.Text(.Pos + 1) Or &H20) <> 108 Then GoTo UnexpectedSymbol
+            If (.Text(.Pos + 2) Or &H20) <> 115 Then GoTo UnexpectedSymbol
+            If (.Text(.Pos + 3) Or &H20) <> 101 Then GoTo UnexpectedSymbol
+            .Pos = .Pos + 4
+            pvJsonParse = False
+        Case 110, 78
+            If (.Text(.Pos) Or &H20) <> 117 Then GoTo UnexpectedSymbol
+            If (.Text(.Pos + 1) Or &H20) <> 108 Then GoTo UnexpectedSymbol
+            If (.Text(.Pos + 2) Or &H20) <> 108 Then GoTo UnexpectedSymbol
+            .Pos = .Pos + 3
+            pvJsonParse = Null
+        Case 48 To 57, 43, 45, 46
+            For lIdx = 0 To 1000
+                Select Case .Text(.Pos + lIdx)
+                Case 48 To 57, 43, 45, 46, 101, 69, 120, 88, 97 To 102, 65 To 70
+                Case Else: Exit For
+                End Select
+            Next
+            sText = Space$(lIdx + 1)
+            CopyMemory ByVal StrPtr(sText), .Text(.Pos - 1), LenB(sText)
+            If LCase$(Left$(sText, 2)) = "0x" Then Mid$(sText, 1, 2) = "&H"
+            On Error GoTo ErrorConvert
+            pvJsonParse = Val(sText)
+            On Error GoTo 0
+            .Pos = .Pos + lIdx
+        Case 0
+            If LenB(.Error) <> 0 Then GoTo QH
+        Case Else
+            GoTo UnexpectedSymbol
+        End Select
+QH:
+        Exit Function
+UnexpectedSymbol:
+        .Error = "Unexpected '" & ChrW$(.LastChar) & "' at position " & .Pos
+        Exit Function
+ErrorConvert:
+        .Error = Err.Description & " at position " & .Pos
+    End With
+    Exit Function
+EH:
+    Debug.Print "pvJsonParse: " & Err.Description
+End Function
+
+Private Function pvJsonGetChar(uCtx As JsonContext) As Integer
+    With uCtx
+        Do While .Pos <= UBound(.Text)
+            .LastChar = .Text(.Pos)
+            .Pos = .Pos + 1
+            Select Case .LastChar
+            Case 0: Exit Function
+            Case 9, 10, 13, 32
+            Case 47
+                If Not .StrictMode Then
+                    Select Case .Text(.Pos)
+                    Case 47
+                        .Pos = .Pos + 1
+                        Do
+                            .LastChar = .Text(.Pos): .Pos = .Pos + 1
+                            If .LastChar = 0 Then Exit Function
+                        Loop While Not (.LastChar = 10 Or .LastChar = 13)
+                    Case 42
+                        Dim lIdx As Long
+                        lIdx = .Pos + 1
+                        Do
+                            .LastChar = .Text(lIdx): lIdx = lIdx + 1
+                            If .LastChar = 0 Then
+                                .Error = "Unterminated comment at position " & .Pos
+                                Exit Function
+                            End If
+                        Loop While Not (.LastChar = 42 And .Text(lIdx) = 47)
+                        .LastChar = .Text(lIdx)
+                        .Pos = lIdx + 1
+                    Case Else
+                        pvJsonGetChar = .LastChar: Exit Do
+                    End Select
+                Else
+                    pvJsonGetChar = .LastChar: Exit Do
+                End If
+            Case Else
+                pvJsonGetChar = .LastChar: Exit Do
+            End Select
+        Loop
+    End With
+End Function
+
+Private Function pvJsonGetString(uCtx As JsonContext) As String
+    Dim lIdx As Long, nChar As Integer, sText As String
+    With uCtx
+        For lIdx = 0 To &H7FFFFFFF
+            nChar = .Text(.Pos + lIdx)
+            Select Case nChar
+            Case 0, 34, 92
+                sText = Space$(lIdx)
+                CopyMemory ByVal StrPtr(sText), .Text(.Pos), LenB(sText)
+                pvJsonGetString = pvJsonGetString & sText
+                If nChar = 34 Then
+                    .Pos = .Pos + lIdx + 1: Exit For
+                ElseIf nChar <> 92 Then
+                    nChar = 0: .Pos = .Pos + lIdx + 1
+                    .Error = "Missing end of string at position " & .Pos: Exit For
+                End If
+                lIdx = lIdx + 1
+                nChar = .Text(.Pos + lIdx)
+                Select Case nChar
+                Case 98:  pvJsonGetString = pvJsonGetString & ChrW$(8)
+                Case 102: pvJsonGetString = pvJsonGetString & ChrW$(12)
+                Case 110: pvJsonGetString = pvJsonGetString & vbLf
+                Case 114: pvJsonGetString = pvJsonGetString & vbCr
+                Case 116: pvJsonGetString = pvJsonGetString & vbTab
+                Case 34:  pvJsonGetString = pvJsonGetString & """"
+                Case 92:  pvJsonGetString = pvJsonGetString & "\"
+                Case 47:  pvJsonGetString = pvJsonGetString & "/"
+                Case 117
+                    pvJsonGetString = pvJsonGetString & ChrW$(CLng("&H" & ChrW$(.Text(.Pos + lIdx + 1)) & ChrW$(.Text(.Pos + lIdx + 2)) & ChrW$(.Text(.Pos + lIdx + 3)) & ChrW$(.Text(.Pos + lIdx + 4))))
+                    lIdx = lIdx + 4
+                Case Else
+                    nChar = 0: .Pos = .Pos + lIdx + 1
+                    .Error = "Invalid escape at position " & .Pos: Exit For
+                End Select
+                .Pos = .Pos + lIdx + 1: lIdx = -1
+            End Select
+        Next
+        .LastChar = nChar
+    End With
+End Function
+
+Private Function pvJsonValueGet(oJson As Object, ByVal sKey As String) As Variant
+    Dim vSplit As Variant, lIdx As Long, vKey As Variant, vItem As Variant
+    Dim oParam As VBA.Collection
+    On Error GoTo EH
+    If oJson Is Nothing Then Exit Function
+    If LenB(sKey) = 0 Then
+        Set pvJsonValueGet = oJson: Exit Function
+    End If
+    vSplit = Split(sKey, "/")
+    Set oParam = oJson
+    For lIdx = 0 To UBound(vSplit)
+        vKey = vSplit(lIdx)
+        If pvJsonC_Str(vKey) = "-1" Then
+            pvJsonValueGet = oParam.Count: Exit Function
+        ElseIf pvJsonIsOnlyDigits(vKey) Then
+            If pvJsonCompareMode(oParam) <> vbBinaryCompare Then vKey = pvJsonC_Lng(vKey)
+        End If
+        pvJsonAssign vItem, pvJsonItemGet(oParam, vKey)
+        If Not IsEmpty(vItem) Then
+            If lIdx < UBound(vSplit) Then
+                If Not IsObject(vItem) Then Exit Function
+                Set oParam = vItem
+            Else
+                pvJsonAssign pvJsonValueGet, vItem
+            End If
+        Else
+            If LenB(vKey) = 0 Then Set pvJsonValueGet = oParam
+            Exit Function
+        End If
+    Next
+    Exit Function
+EH:
+End Function
+
+Private Sub pvJsonValueLet(oJson As Object, ByVal sKey As String, vValue As Variant)
+    Dim vSplit As Variant, lIdx As Long, vKey As Variant, lKey As Long
+    Dim oParam As VBA.Collection
+    On Error GoTo EH
+    If LenB(sKey) = 0 Then Exit Sub
+    vSplit = Split(sKey, "/")
+    If oJson Is Nothing Then
+        Set oJson = pvJsonCreateObject(-(pvJsonIsOnlyDigits(vSplit(0)) Or vSplit(0) = "-1"))
+    End If
+    Set oParam = oJson
+    For lIdx = 0 To UBound(vSplit)
+        vKey = vSplit(lIdx)
+        If pvJsonC_Str(vKey) = "-1" Then vKey = oParam.Count
+        If pvJsonIsOnlyDigits(vKey) Then
+            If pvJsonCompareMode(oParam) <> vbBinaryCompare Then vKey = pvJsonC_Lng(vKey)
+        End If
+        If lIdx < UBound(vSplit) Then
+            If Not IsObject(pvJsonItemGet(oParam, vKey)) Then
+                pvJsonItemLet oParam, vKey, pvJsonCreateObject(-(pvJsonIsOnlyDigits(vSplit(lIdx + 1)) Or vSplit(lIdx + 1) = "-1"))
+            End If
+            Set oParam = pvJsonItemGet(oParam, vKey)
+        ElseIf IsEmpty(vValue) Then
+            If VarType(vKey) = vbLong Then
+                lKey = vKey + JSON_IDX_OFFSET
+                If lKey > 0 And lKey <= oParam.Count Then oParam.Remove lKey
+            Else
+                If pvJsonCollIndexByKey(oParam, vKey, JSON_DEF_IGNORE_CASE) > 0 Then oParam.Remove vKey
+            End If
+        Else
+            pvJsonItemLet oParam, vKey, vValue
+        End If
+    Next
+    Exit Sub
+EH:
+    Debug.Print "pvJsonValueLet: " & Err.Description
+End Sub
+
+Private Function pvJsonKeys(oJson As Object, Optional ByVal Key As String) As Variant
+    Dim vSplit As Variant, lIdx As Long, vKey As Variant, vItem As Variant, lCount As Long
+    Dim oParam As VBA.Collection
+    On Error GoTo EH
+    If oJson Is Nothing Then pvJsonKeys = Array(): Exit Function
+    If LenB(Key) = 0 Then
+        Set oParam = oJson
+    Else
+        vSplit = Split(Key, "/")
+        Set oParam = oJson
+        For lIdx = 0 To UBound(vSplit)
+            vKey = vSplit(lIdx)
+            If pvJsonIsOnlyDigits(vKey) Then
+                If pvJsonCompareMode(oParam) <> vbBinaryCompare Then vKey = pvJsonC_Lng(vKey)
+            End If
+            pvJsonAssign vItem, pvJsonItemGet(oParam, vKey)
+            If IsObject(vItem) Then
+                Set oParam = vItem
+            Else
+                pvJsonKeys = Array(): Exit Function
+            End If
+        Next
+    End If
+    lCount = oParam.Count
+    If lCount = 0 Then pvJsonKeys = Array(): Exit Function
+    ReDim vItem(0 To lCount - 1) As Variant
+    If pvJsonCompareMode(oParam) = vbBinaryCompare Then
+        vItem = pvJsonCollAllKeys(oParam)
+    Else
+        For lIdx = 0 To UBound(vItem): vItem(lIdx) = lIdx: Next
+    End If
+    pvJsonKeys = vItem
+    Exit Function
+EH:
+    pvJsonKeys = Array()
+End Function
+
+Private Function pvJsonDump(vJson As Variant, Optional ByVal Level As Long, Optional ByVal Minimize As Boolean, _
+            Optional CompoundChars As String, Optional IndentSize As Long = 4, Optional ByVal MaxWidth As Long = 100) As String
+    Static vTranscode As Variant
+    Dim vKeys As Variant, vItems As Variant, lIdx As Long, lSize As Long
+    Dim sSpace As String, lAsc As Long, lCompareMode As VbCompareMethod, lCount As Long
+    Dim oJson As VBA.Collection
+    Select Case VarType(vJson)
+    Case vbObject
+        Set oJson = vJson
+        If oJson Is Nothing Then Exit Function
+        lCompareMode = pvJsonCompareMode(oJson)
+        If LenB(CompoundChars) = 0 Then CompoundChars = IIf(lCompareMode = vbBinaryCompare, "{}", "[]")
+        lCount = oJson.Count
+        If lCount <= 0 Then
+            pvJsonDump = CompoundChars
+        Else
+            sSpace = IIf(Minimize, vbNullString, " ")
+            ReDim vItems(0 To lCount - 1) As String
+            If lCompareMode = vbBinaryCompare Then
+                vKeys = pvJsonCollAllKeys(oJson)
+                If UBound(vKeys) >= 0 Then
+                    If LenB(vKeys(0)) = 0 Then lCompareMode = vbTextCompare
+                End If
+            End If
+            For lIdx = 0 To lCount - 1
+                If lCompareMode = vbBinaryCompare Then
+                    vItems(lIdx) = pvJsonDump(vKeys(lIdx)) & ":" & sSpace & pvJsonDump(oJson.Item(vKeys(lIdx)), Level + 1, Minimize, , IndentSize, MaxWidth)
+                Else
+                    vItems(lIdx) = pvJsonDump(oJson.Item(lIdx + JSON_IDX_OFFSET), Level + 1, Minimize, , IndentSize, MaxWidth)
+                End If
+                lSize = lSize + Len(vItems(lIdx))
+            Next
+            If lSize > MaxWidth And Not Minimize Then
+                pvJsonDump = Left$(CompoundChars, 1) & vbCrLf & _
+                    Space$(IIf(Level > -1, Level + 1, 0) * IndentSize) & Join(vItems, "," & vbCrLf & Space$(IIf(Level > -1, Level + 1, 0) * IndentSize)) & vbCrLf & _
+                    Space$(IIf(Level > 0, Level, 0) * IndentSize) & Right$(CompoundChars, 1)
+            Else
+                pvJsonDump = Left$(CompoundChars, 1) & sSpace & Join(vItems, "," & sSpace) & sSpace & Right$(CompoundChars, 1)
+            End If
+        End If
+    Case vbNull, vbEmpty
+        pvJsonDump = "null"
+    Case vbDate
+        pvJsonDump = """" & Format$(vJson, "yyyy\-mm\-dd hh:nn:ss") & """"
+        If Left$(pvJsonDump, 12) = """1899-12-30 " Then pvJsonDump = """" & Mid$(pvJsonDump, 13)
+    Case vbBoolean
+        pvJsonDump = IIf(vJson, "true", "false")
+    Case vbString
+        If vJson Like "*[?""\" & Chr$(0) & "-" & Chr$(31) & "]*" Then
+            If IsEmpty(vTranscode) Then
+                vTranscode = Split("\u0000|\u0001|\u0002|\u0003|\u0004|\u0005|\u0006|\u0007|\b|\t|\n|\u000B|\f|\r|\u000E|\u000F|\u0010|\u0011|" & _
+                                   "\u0012|\u0013|\u0014|\u0015|\u0016|\u0017|\u0018|\u0019|\u001A|\u001B|\u001C|\u001D|\u001E|\u001F", "|")
+            End If
+            For lIdx = 1 To Len(vJson)
+                lAsc = AscW(Mid$(vJson, lIdx, 1))
+                If lAsc = 92 Or lAsc = 34 Then
+                    pvJsonDump = pvJsonDump & "\" & ChrW$(lAsc)
+                ElseIf lAsc >= 32 And lAsc < 256 Then
+                    pvJsonDump = pvJsonDump & ChrW$(lAsc)
+                ElseIf lAsc >= 0 And lAsc < 32 Then
+                    pvJsonDump = pvJsonDump & vTranscode(lAsc)
+                ElseIf Asc(Mid$(vJson, lIdx, 1)) <> 63 Or Mid$(vJson, lIdx, 1) = "?" Then
+                    pvJsonDump = pvJsonDump & ChrW$(AscW(Mid$(vJson, lIdx, 1)))
+                Else
+                    pvJsonDump = pvJsonDump & "\u" & Right$("0000" & Hex$(lAsc), 4)
+                End If
+            Next
+            pvJsonDump = """" & pvJsonDump & """"
+        Else
+            pvJsonDump = """" & vJson & """"
+        End If
+    Case Else
+        If IsNumeric(vJson) Then
+            pvJsonDump = Trim$(Replace(Replace(Str$(vJson), " .", "0."), "-.", "-0."))
+        Else
+            pvJsonDump = vJson & vbNullString
+        End If
+    End Select
+End Function
+
+Private Function pvJsonCreateObject(ByVal lCompareMode As VbCompareMethod) As VBA.Collection
+    Set pvJsonCreateObject = New VBA.Collection
+    CopyMemory ByVal ObjPtr(pvJsonCreateObject) + o_pvUnk5, lCompareMode, 4
+End Function
+
+Private Function pvJsonCompareMode(oJson As VBA.Collection) As VbCompareMethod
+    CopyMemory pvJsonCompareMode, ByVal ObjPtr(oJson) + o_pvUnk5, 4
+    pvJsonCompareMode = -(pvJsonCompareMode = vbTextCompare)
+End Function
+
+Private Property Get pvJsonItemGet(oParam As VBA.Collection, vKey As Variant) As Variant
+    Dim lKey As Long
+    On Error GoTo EH
+    If VarType(vKey) = vbLong Then
+        lKey = vKey + JSON_IDX_OFFSET
+        If lKey > 0 And lKey <= oParam.Count Then pvJsonAssign pvJsonItemGet, oParam.Item(lKey)
+    Else
+        If pvJsonCollIndexByKey(oParam, vKey, JSON_DEF_IGNORE_CASE) > 0 Then
+            pvJsonAssign pvJsonItemGet, oParam.Item(vKey)
+        End If
+    End If
+    Exit Property
+EH:
+End Property
+
+Private Sub pvJsonItemLet(oParam As VBA.Collection, vKey As Variant, vValue As Variant)
+    Dim lKey As Long
+    On Error GoTo EH
+    If VarType(vKey) = vbLong Then
+        lKey = vKey + 1
+        If lKey > 0 And lKey <= oParam.Count Then oParam.Remove lKey
+        If lKey > 0 And lKey <= oParam.Count Then
+            oParam.Add vValue, Before:=lKey
+        Else
+            Do While lKey - 1 > oParam.Count: oParam.Add Empty: Loop
+            oParam.Add vValue
+        End If
+    Else
+        lKey = pvJsonCollIndexByKey(oParam, vKey, JSON_DEF_IGNORE_CASE)
+        If lKey > 0 Then oParam.Remove lKey
+        If lKey > 0 And lKey <= oParam.Count Then
+            oParam.Add vValue, vKey, Before:=lKey
+        Else
+            oParam.Add vValue, vKey
+        End If
+    End If
+    Exit Sub
+EH:
+    Debug.Print "pvJsonItemLet: " & Err.Description
+End Sub
+
+Private Function pvJsonCollAllKeys(oCol As VBA.Collection, Optional ByVal StartIndex As Long) As String()
+    Dim lPtr As Long, aRetVal() As String, lIdx As Long, sTemp As String
+    If oCol.Count = 0 Then
+        aRetVal = Split(vbNullString)
+    Else
+        ReDim aRetVal(StartIndex To StartIndex + oCol.Count - 1) As String
+        lPtr = ObjPtr(oCol)
+        For lIdx = LBound(aRetVal) To UBound(aRetVal)
+            CopyMemory lPtr, ByVal lPtr + o_pNextIndexedItem, 4
+            CopyMemory ByVal VarPtr(sTemp), ByVal lPtr + o_KeyPtr, 4
+            aRetVal(lIdx) = sTemp
+        Next
+        CopyMemory ByVal VarPtr(sTemp), 0&, 4
+    End If
+    pvJsonCollAllKeys = aRetVal
+End Function
+
+Private Function pvJsonCollIndexByKey(oCol As VBA.Collection, ByVal sKey As String, Optional ByVal IgnoreCase As Boolean = True) As Long
+    Dim lItemPtr As Long, lEofPtr As Long, lPtr As Long
+    Dim sTemp As String, eMethod As VbCompareMethod
+    If Not oCol Is Nothing Then
+        CopyMemory lItemPtr, ByVal ObjPtr(oCol) + o_pRootTreeItem, 4
+        CopyMemory lEofPtr, ByVal ObjPtr(oCol) + o_pEndTreePtr, 4
+    End If
+    eMethod = IIf(IgnoreCase, vbTextCompare, vbBinaryCompare)
+    Do While lItemPtr <> lEofPtr
+        CopyMemory ByVal VarPtr(sTemp), ByVal lItemPtr + o_KeyPtr, 4
+        Select Case StrComp(sKey, sTemp, eMethod)
+        Case Is < 0
+            CopyMemory lItemPtr, ByVal lItemPtr + o_pLeftBranch, 4
+        Case Is > 0
+            CopyMemory lItemPtr, ByVal lItemPtr + o_pRightBranch, 4
+        Case Else
+            lPtr = ObjPtr(oCol)
+            Do While lPtr <> lItemPtr
+                CopyMemory lPtr, ByVal lPtr + o_pNextIndexedItem, 4
+                pvJsonCollIndexByKey = pvJsonCollIndexByKey + 1
+            Loop
+            GoTo QH
+        End Select
+    Loop
+QH:
+    CopyMemory ByVal VarPtr(sTemp), 0&, 4
+End Function
+
+Private Sub pvJsonAssign(vDest As Variant, vSrc As Variant)
+    On Error GoTo QH
+    If IsObject(vSrc) Then Set vDest = vSrc Else vDest = vSrc
+QH:
+End Sub
+
+Private Function pvJsonC_Str(Value As Variant) As String
+    Dim vDest As Variant
+    If VarType(Value) = vbString Then
+        pvJsonC_Str = Value
+    ElseIf VariantChangeType(vDest, Value, JSON_VARIANT_ALPHABOOL, vbString) = 0 Then
+        pvJsonC_Str = vDest
+    End If
+End Function
+
+Private Function pvJsonC_Bool(Value As Variant) As Boolean
+    Dim vDest As Variant
+    If VarType(Value) = vbBoolean Then
+        pvJsonC_Bool = Value
+    ElseIf VariantChangeType(vDest, Value, JSON_VARIANT_ALPHABOOL, vbBoolean) = 0 Then
+        pvJsonC_Bool = vDest
+    End If
+End Function
+
+Private Function pvJsonC_Lng(Value As Variant) As Long
+    Dim vDest As Variant
+    If VarType(Value) = vbLong Then
+        pvJsonC_Lng = Value
+    ElseIf VariantChangeType(vDest, Value, 0, vbLong) = 0 Then
+        pvJsonC_Lng = vDest
+    End If
+End Function
+
+Private Function pvJsonC_Dbl(Value As Variant) As Double
+    Dim vDest As Variant
+    If VarType(Value) = vbDouble Then
+        pvJsonC_Dbl = Value
+    ElseIf VariantChangeType(vDest, Value, 0, vbDouble) = 0 Then
+        pvJsonC_Dbl = vDest
+    End If
+End Function
+
+Private Function pvJsonIsOnlyDigits(ByVal sText As String) As Boolean
+    If LenB(sText) <> 0 Then pvJsonIsOnlyDigits = Not (sText Like "*[!0-9]*")
+End Function
+
+'=========================================================================
 ' UserControl events
 '=========================================================================
 
@@ -3490,6 +4243,7 @@ Private Sub UserControl_Terminate()
     Const FUNC_NAME As String = "UserControl_Terminate"
     On Error GoTo EH
     Disconnect
+    JsonClose
     If m_bWsaInitialized Then
         WSACleanup
         m_bWsaInitialized = False
