@@ -44,7 +44,7 @@ Attribute VB_PredeclaredId = False
 Attribute VB_Exposed = False
 '=========================================================================
 '
-' czSocket User Control v1.2 (c) 2026
+' czSocket User Control v1.3 (c) 2026
 ' Single-file VB6 socket control with full networking support
 ' Inspired by VbAsyncSocket Project (wqweto@gmail.com)
 '
@@ -56,6 +56,10 @@ Attribute VB_Exposed = False
 '   - Streaming file upload (multipart/form-data, 64KB chunks)
 '   - Streaming file download (save to disk, 64KB recv loop)
 '   - Download resume with HTTP Range header support
+'   - IDM-style segmented download (multi-connection parallel)
+'   - HTTP proxy support (CONNECT tunnel)
+'   - Bandwidth throttling (configurable speed limit)
+'   - Download state persistence (resume after reboot)
 '   - Chunked file sending with progress, speed, and ETA tracking
 '   - Universal API: auto-detects protocol from URL scheme
 '   - High-performance: 175+ MB/s download, 115+ MB/s upload
@@ -94,8 +98,11 @@ Attribute VB_Exposed = False
 '       - Raw TCP/TLS: sends raw bytes
 '       Fires Progress with speed and ETA.
 '
-'   Download Url, SavePath, [ExtraHeaders]
+'   Download Url, SavePath, [ExtraHeaders], [ResumeFrom]
 '       Downloads a file via HTTP/HTTPS and saves to disk.
+'       If DownloadSegments > 1 and server supports Range requests,
+'       automatically uses IDM-style segmented download (multi-connection).
+'       Falls back to single connection if server does not support Range.
 '       Fires Progress during download, Response on complete.
 '
 '   Upload Url, FilePath, [FieldName="file"], [ExtraHeaders]
@@ -132,6 +139,15 @@ Attribute VB_Exposed = False
 '
 '   Ping [Data]
 '       Sends a WebSocket ping frame (only when connected via ws/wss).
+'
+'   SaveDownloadState [StateFile]
+'       Save active download state to file for resume after restart.
+'
+'   LoadDownloadState [StateFile] As Boolean
+'       Load and resume a previously saved download state.
+'
+'   ClearDownloadState [StateFile]
+'       Delete saved download state file.
 '
 ' METHODS (JSON Engine):
 '   JsonParse(sJsonText) As czSocket
@@ -203,14 +219,23 @@ Attribute VB_Exposed = False
 '   SocketHandle As Long     — (Read-only) Raw WinSock handle
 '   Timeout As Long          — Connection timeout in seconds
 '   StatusCode As Long       — (Read-only) Last HTTP response status code
-'   ReadyState As Long          — (Read-only) WebSocket state (0=None,1=Connecting,2=Open,3=Closing)
+'   ReadyState As Long       — (Read-only) WebSocket state (0=None,1=Connecting,2=Open,3=Closing)
 '   SockOpt(OptionName, [Level]) — Get/Set raw socket options
+'   DownloadSegments As Long — Number of parallel segments for download (1=single, 2-16=segmented)
+'   IsSegmented As Boolean   — (Read-only) True if current download uses segmented mode
+'   MaxBandwidth As Long     — Max download speed in bytes/sec (0=unlimited)
+'   ProxyHost As String      — HTTP proxy host (empty=direct connection)
+'   ProxyPort As Long        — HTTP proxy port
+'   ProxyUser As String      — Proxy authentication username
+'   ProxyPass As String      — Proxy authentication password
+'   StateAutoSaveInterval As Long — Auto-save state every N seconds (0=disabled)
 '
 ' ENUMS:
 '   UcsProtocolConstants: sckTCPProtocol=0, sckUDPProtocol=1, sckTLSProtocol=2
 '   UcsStateConstants:    sckClosed=0 .. sckConnected=7 .. sckClosing=8 .. sckError=9
 '
 '=========================================================================
+
 Option Explicit
 DefObj A-Z
 Private Const MODULE_NAME As String = "czSocket"
@@ -797,6 +822,71 @@ Private m_sCertSubject          As String   '--- Cert subject filter
 '--- JSON Engine Cache ---
 Private m_oJsonRoot As Object
 
+'--- Segmented download state
+Private m_lDownloadSegments     As Long     '--- Desired segment count (default 4)
+Private m_bSegActive            As Boolean  '--- Segmented download in progress
+Private m_bSegHeadPhase         As Boolean  '--- HEAD request phase
+Private m_sSegUrl               As String   '--- Target URL
+Private m_sSegSavePath          As String   '--- Final file path
+Private m_sSegExtraHeaders      As String   '--- Extra headers
+Private m_lSegFileSize          As Long     '--- Total file size from HEAD
+Private m_lSegTotalRecv         As Long     '--- Aggregate bytes received
+Private m_dSegStartTime         As Double   '--- Transfer start time
+Private m_lSegFileHandle        As Integer  '--- File handle for direct-write
+Private m_sSegHost              As String   '--- Target host
+Private m_lSegPort              As Long     '--- Target port
+Private m_sSegPath              As String   '--- URL path
+Private m_bSegUseTls            As Boolean  '--- HTTPS?
+Private m_lSegCount             As Long     '--- Actual segment count
+Private m_lSegDoneCount         As Long     '--- Segments completed
+'--- Per-segment arrays (parallel arrays for simplicity in VB6)
+Private m_lSegStatus()          As Long     '--- 0=idle, 1=connecting, 2=downloading, 3=done, 4=error
+Private m_lSegStartByte()       As Long     '--- Range start per segment
+Private m_lSegEndByte()         As Long     '--- Range end per segment
+Private m_lSegBytesRecv()       As Long     '--- Bytes received per segment
+Private m_lSegRetryCount()      As Long     '--- Retry counter per segment
+Private m_hSegSocket()          As Long     '--- Raw socket handle per segment
+Private m_hSegEvent()           As Long     '--- WSA event handle per segment
+Private m_hSegCred()            As Long     '--- TLS cred handles (2 per segment)
+Private m_hSegCtx()             As Long     '--- TLS ctx handles (2 per segment)
+Private m_bSegHasCred()         As Boolean  '--- Has TLS credentials
+Private m_bSegHasCtx()          As Boolean  '--- Has TLS context
+Private m_uSegStreamSizes()    As SecPkgContext_StreamSizes '--- TLS stream sizes
+Private m_baSegTlsPending()     As Variant  '--- TLS pending data (each element is a Byte() array)
+Private m_lSegTlsState()        As Long     '--- TLS state per segment
+Private m_bSegHeadersDone()     As Boolean  '--- HTTP headers parsed per segment
+Private m_sSegRawHeader()       As String   '--- Raw header accumulator per segment
+Private m_sSegRecvBuf()         As String   '--- Recv buffer per segment (raw TCP data before TLS decrypt or after)
+
+'--- Proxy support
+Private m_sProxyHost            As String   '--- Proxy server host
+Private m_lProxyPort            As Long     '--- Proxy server port
+Private m_sProxyUser            As String   '--- Proxy auth username
+Private m_sProxyPass            As String   '--- Proxy auth password
+Private m_bProxyConnecting      As Boolean  '--- CONNECT handshake in progress
+Private m_sProxyTargetHost      As String   '--- Real target host (saved during proxy connect)
+Private m_lProxyTargetPort      As Long     '--- Real target port
+Private m_sProxyRecvBuf         As String   '--- Buffer for proxy response during CONNECT
+
+'--- Bandwidth throttling
+Private m_lMaxBandwidth         As Long     '--- Max bytes/sec (0 = unlimited)
+Private m_lBwBytesThisSec       As Long     '--- Bytes received in current second
+Private m_dBwLastReset          As Double   '--- Timer value at last second boundary
+
+'--- State persistence
+Private m_lStateAutoSave        As Long     '--- Auto-save interval in seconds (0=disabled)
+Private m_dLastStateSave        As Double   '--- Timer value at last state save
+
+'--- Segmented download constants
+Private Const SEG_IDLE          As Long = 0
+Private Const SEG_CONNECTING    As Long = 1
+Private Const SEG_DOWNLOADING   As Long = 2
+Private Const SEG_DONE          As Long = 3
+Private Const SEG_ERROR         As Long = 4
+Private Const SEG_MAX_RETRIES   As Long = 3
+Private Const SEG_MAX_COUNT     As Long = 16
+Private Const STATE_MAGIC       As String = "CZST"
+
 '=========================================================================
 ' Error handling
 '=========================================================================
@@ -953,12 +1043,85 @@ Property Get ReadyState() As Long
     ReadyState = m_lWsState
 End Property
 
+'--- Segmented download properties
+Property Get DownloadSegments() As Long
+    DownloadSegments = m_lDownloadSegments
+End Property
+
+Property Let DownloadSegments(ByVal lValue As Long)
+    If lValue < 1 Then lValue = 1
+    If lValue > SEG_MAX_COUNT Then lValue = SEG_MAX_COUNT
+    m_lDownloadSegments = lValue
+End Property
+
+Property Get IsSegmented() As Boolean
+    IsSegmented = m_bSegActive
+End Property
+
+'--- Bandwidth throttling properties
+Property Get MaxBandwidth() As Long
+    MaxBandwidth = m_lMaxBandwidth
+End Property
+
+Property Let MaxBandwidth(ByVal lValue As Long)
+    If lValue < 0 Then lValue = 0
+    m_lMaxBandwidth = lValue
+End Property
+
+'--- Proxy properties
+Property Get ProxyHost() As String
+    ProxyHost = m_sProxyHost
+End Property
+
+Property Let ProxyHost(sValue As String)
+    m_sProxyHost = sValue
+End Property
+
+Property Get ProxyPort() As Long
+    ProxyPort = m_lProxyPort
+End Property
+
+Property Let ProxyPort(ByVal lValue As Long)
+    m_lProxyPort = lValue
+End Property
+
+Property Get ProxyUser() As String
+    ProxyUser = m_sProxyUser
+End Property
+
+Property Let ProxyUser(sValue As String)
+    m_sProxyUser = sValue
+End Property
+
+Property Get ProxyPass() As String
+    ProxyPass = m_sProxyPass
+End Property
+
+Property Let ProxyPass(sValue As String)
+    m_sProxyPass = sValue
+End Property
+
+'--- State persistence properties
+Property Get StateAutoSaveInterval() As Long
+    StateAutoSaveInterval = m_lStateAutoSave
+End Property
+
+Property Let StateAutoSaveInterval(ByVal lValue As Long)
+    If lValue < 0 Then lValue = 0
+    m_lStateAutoSave = lValue
+End Property
+
 '=========================================================================
 ' Public Methods
 '=========================================================================
 
 Public Sub Disconnect()
     On Error GoTo EH
+    '--- Cleanup segmented download sockets if active
+    If m_bSegActive Then pvSegCleanup
+    '--- Reset proxy state
+    m_bProxyConnecting = False
+    m_sProxyRecvBuf = vbNullString
     '--- WebSocket graceful close if open
     If m_lWsState = WS_OPEN Then
         m_lWsState = WS_CLOSING
@@ -1088,7 +1251,15 @@ Public Sub Connect(Optional RemoteHost As String, Optional ByVal RemotePort As L
     '--- Resolve host
     pvState = sckResolvingHost
     Dim lAddr As Long
-    lAddr = pvResolveHost(m_sRemoteHost)
+    '--- Proxy routing: connect to proxy instead of target
+    If LenB(m_sProxyHost) <> 0 Then
+        m_sProxyTargetHost = m_sRemoteHost
+        m_lProxyTargetPort = m_lRemotePort
+        m_bProxyConnecting = True
+        lAddr = pvResolveHost(m_sProxyHost)
+    Else
+        lAddr = pvResolveHost(m_sRemoteHost)
+    End If
     If lAddr = INADDR_NONE Then
         pvSetError LastDllError:=sckHostNotFound, RaiseError:=True
         GoTo QH
@@ -1106,13 +1277,17 @@ Public Sub Connect(Optional RemoteHost As String, Optional ByVal RemotePort As L
     End If
     '--- Setup async events
     If Not pvSetupAsyncEvents(FD_CONNECT Or FD_READ Or FD_WRITE Or FD_CLOSE) Then GoTo QH
-    '--- Connect
+    '--- Connect (to proxy or directly)
     pvState = sckConnecting
     m_bConnecting = True
     Dim uAddr As SOCKADDR_IN
     uAddr.sin_family = AF_INET
     uAddr.sin_addr = lAddr
-    uAddr.sin_port = ws_htons(m_lRemotePort)
+    If LenB(m_sProxyHost) <> 0 Then
+        uAddr.sin_port = ws_htons(m_lProxyPort)
+    Else
+        uAddr.sin_port = ws_htons(m_lRemotePort)
+    End If
     Dim lResult As Long
     lResult = ws_connect(m_hSocket, uAddr, LenB(uAddr))
     If lResult = SOCKET_ERROR Then
@@ -1519,6 +1694,12 @@ End Sub
 
 Public Sub Download(Url As String, SavePath As String, Optional ExtraHeaders As String, Optional ByVal ResumeFrom As Long = 0)
     On Error GoTo EH
+    '--- NEW: If segments > 1 and not resuming, try segmented download
+    If m_lDownloadSegments > 1 And ResumeFrom = 0 Then
+        pvSegStart Url, SavePath, ExtraHeaders
+        Exit Sub
+    End If
+    '--- EXISTING: Single connection download (unchanged)
     '--- Add Range header for resume
     Dim sHeaders As String
     sHeaders = ExtraHeaders
@@ -2496,6 +2677,17 @@ End Sub
 Private Sub tmrPoll_Timer()
     Const FUNC_NAME As String = "tmrPoll_Timer"
     On Error GoTo EH
+    '--- Poll segmented download sockets (independent of main socket)
+    If m_bSegActive Then
+        pvPollSegments
+        '--- Auto-save state if configured
+        If m_lStateAutoSave > 0 Then
+            If Timer - m_dLastStateSave >= CDbl(m_lStateAutoSave) Then
+                SaveDownloadState
+                m_dLastStateSave = Timer
+            End If
+        End If
+    End If
     If m_hSocket = INVALID_SOCKET Or m_hSocket = 0 Then Exit Sub
     If m_hEvent = 0 Then Exit Sub
     '--- Check WSA event (non-blocking, timeout=0)
@@ -2505,7 +2697,9 @@ Private Sub tmrPoll_Timer()
     '--- Enumerate events
     Dim uNE As WSANETWORKEVENTS_TYPE
     If WSAEnumNetworkEvents(m_hSocket, m_hEvent, uNE) = SOCKET_ERROR Then Exit Sub
-    '--- Process events
+    '--- Process events (save socket handle to detect replacement mid-processing)
+    Dim hOrigSocket As Long
+    hOrigSocket = m_hSocket
     If (uNE.lNetworkEvents And FD_CONNECT) <> 0 Then
         If uNE.iErrorCode(FD_CONNECT_BIT) <> 0 Then
             pvSetError LastDllError:=uNE.iErrorCode(FD_CONNECT_BIT)
@@ -2513,21 +2707,27 @@ Private Sub tmrPoll_Timer()
             pvOnConnect
         End If
     End If
+    '--- If socket was replaced (e.g. HEAD→fallback→new Connect), stop processing stale events
+    If m_hSocket <> hOrigSocket Then Exit Sub
     If (uNE.lNetworkEvents And FD_ACCEPT) <> 0 Then
         If uNE.iErrorCode(FD_ACCEPT_BIT) = 0 Then
             pvOnAccept
         End If
     End If
+    If m_hSocket <> hOrigSocket Then Exit Sub
     If (uNE.lNetworkEvents And FD_READ) <> 0 Then
         If uNE.iErrorCode(FD_READ_BIT) = 0 Then
             pvOnReceive
         End If
     End If
+    '--- Guard: if socket changed during pvOnReceive (HEAD→fallback→new socket), bail out
+    If m_hSocket <> hOrigSocket Then Exit Sub
     If (uNE.lNetworkEvents And FD_WRITE) <> 0 Then
         If uNE.iErrorCode(FD_WRITE_BIT) = 0 Then
             pvOnSend
         End If
     End If
+    If m_hSocket <> hOrigSocket Then Exit Sub
     If (uNE.lNetworkEvents And FD_CLOSE) <> 0 Then
         pvOnClose
     End If
@@ -2543,6 +2743,11 @@ End Sub
 Private Sub pvOnConnect()
     Const FUNC_NAME As String = "pvOnConnect"
     On Error GoTo EH
+    '--- Handle proxy CONNECT handshake
+    If m_bProxyConnecting Then
+        pvProxySendConnect
+        Exit Sub
+    End If
     If m_eProtocol = sckTLSProtocol Then
         '--- Start TLS handshake
         pvTlsBeginHandshake
@@ -2565,16 +2770,32 @@ Private Sub pvOnReceive()
     Dim lRecv As Long
     On Error GoTo EH
     '--- Loop to drain all available data (not just one chunk per timer tick)
+    Dim hRecvSocket As Long
+    hRecvSocket = m_hSocket
     Do
+        '--- Guard: if socket was replaced during processing (e.g. HEAD→fallback), stop
+        If m_hSocket <> hRecvSocket Then Exit Do
+        '--- Bandwidth throttling check
+        Dim lMaxRecv As Long
+        lMaxRecv = RECV_BUFFER_SIZE
+        If m_lMaxBandwidth > 0 Then
+            If Timer - m_dBwLastReset >= 1# Then
+                m_lBwBytesThisSec = 0
+                m_dBwLastReset = Timer
+            End If
+            If m_lBwBytesThisSec >= m_lMaxBandwidth Then Exit Do
+            lMaxRecv = m_lMaxBandwidth - m_lBwBytesThisSec
+            If lMaxRecv > RECV_BUFFER_SIZE Then lMaxRecv = RECV_BUFFER_SIZE
+        End If
         '--- Receive data from socket
-        ReDim baBuffer(0 To RECV_BUFFER_SIZE - 1)
+        ReDim baBuffer(0 To lMaxRecv - 1)
         If m_eProtocol = sckUDPProtocol Then
             Dim uFrom As SOCKADDR_IN
             Dim lFromLen As Long
             lFromLen = LenB(uFrom)
-            lRecv = ws_recvfrom(m_hSocket, baBuffer(0), RECV_BUFFER_SIZE, 0, uFrom, lFromLen)
+            lRecv = ws_recvfrom(m_hSocket, baBuffer(0), lMaxRecv, 0, uFrom, lFromLen)
         Else
-            lRecv = ws_recv(m_hSocket, baBuffer(0), RECV_BUFFER_SIZE, 0)
+            lRecv = ws_recv(m_hSocket, baBuffer(0), lMaxRecv, 0)
         End If
         If lRecv = SOCKET_ERROR Then
             Dim lErr As Long
@@ -2590,6 +2811,8 @@ Private Sub pvOnReceive()
         End If
         '--- Trim buffer to actual size
         ReDim Preserve baBuffer(0 To lRecv - 1)
+        '--- Update bandwidth counter
+        If m_lMaxBandwidth > 0 Then m_lBwBytesThisSec = m_lBwBytesThisSec + lRecv
         '--- Process based on TLS state
         Select Case m_lTlsState
         Case TLS_HANDSHAKE
@@ -2635,6 +2858,11 @@ EH:
 End Sub
 
 Private Sub pvDispatchReceivedData()
+    '--- Handle proxy CONNECT response
+    If m_bProxyConnecting Then
+        pvProxyOnResponse
+        Exit Sub
+    End If
     '--- Route received data based on active mode
     Select Case m_lWsState
     Case WS_CONNECTING
@@ -2720,8 +2948,11 @@ Private Sub pvOnClose()
     m_lHttpState = HTTP_NONE
     m_lWsState = WS_NONE
     pvState = sckClosing
-    RaiseEvent Disconnected(0, vbNullString)
-    '--- Cleanup
+    '--- Don't fire Disconnected if segmented download is running (HEAD socket just closed)
+    If Not m_bSegActive Then
+        RaiseEvent Disconnected(0, vbNullString)
+    End If
+    '--- Cleanup main socket
     If m_hSocket <> INVALID_SOCKET And m_hSocket <> 0 Then
         ws_closesocket m_hSocket
         m_hSocket = INVALID_SOCKET
@@ -2731,7 +2962,10 @@ Private Sub pvOnClose()
         m_hEvent = 0
     End If
     pvTlsCleanup
-    tmrPoll.Enabled = False
+    '--- Keep timer running if segmented download is active
+    If Not m_bSegActive Then
+        tmrPoll.Enabled = False
+    End If
     m_bListening = False
     m_bConnecting = False
     pvState = sckClosed
@@ -3022,6 +3256,12 @@ Private Sub pvHttpProcessResponse()
         End If
         '--- Check for chunked transfer encoding
         m_bHttpChunked = (InStr(1, pvHttpGetHeader(sHeaders, "Transfer-Encoding"), "chunked", vbTextCompare) > 0)
+        '--- HEAD response: fire immediately (no body expected for HEAD)
+        If m_bSegHeadPhase Then
+            m_lHttpState = HTTP_NONE
+            pvFireResponse m_lHttpStatus, m_sHttpContentType, vbNullString, m_sHttpHeaders
+            Exit Sub
+        End If
         '--- For 206 Partial Content (resume), Content-Length is remaining bytes
         '--- Adjust total to include already-downloaded portion
         If m_lHttpStatus = 206 And m_lDownloadResumeFrom > 0 And m_lHttpContentLength > 0 Then
@@ -3100,6 +3340,11 @@ EH:
 End Sub
 
 Private Sub pvFireResponse(ByVal lStatus As Long, sContentType As String, sBody As String, sHeaders As String)
+    '--- Intercept HEAD response for segmented download
+    If m_bSegHeadPhase Then
+        pvSegOnHeadResponse lStatus, sHeaders
+        Exit Sub
+    End If
     '--- If download mode, save body to file
     If m_bDownloadMode And LenB(m_sDownloadPath) <> 0 Then
         pvWriteFileFromString m_sDownloadPath, sBody
@@ -3378,6 +3623,1024 @@ Private Sub pvWsProcessFrames()
     Exit Sub
 EH:
     PrintError FUNC_NAME
+End Sub
+
+'=========================================================================
+' Private - Proxy CONNECT tunnel
+'=========================================================================
+
+Private Sub pvProxySendConnect()
+    Const FUNC_NAME As String = "pvProxySendConnect"
+    On Error GoTo EH
+    '--- Build CONNECT request
+    Dim sReq As String
+    sReq = "CONNECT " & m_sProxyTargetHost & ":" & m_lProxyTargetPort & " HTTP/1.1" & vbCrLf & _
+           "Host: " & m_sProxyTargetHost & ":" & m_lProxyTargetPort & vbCrLf
+    '--- Add proxy authentication if credentials set
+    If LenB(m_sProxyUser) <> 0 Then
+        sReq = sReq & "Proxy-Authorization: Basic " & pvBase64EncodeSimple(m_sProxyUser & ":" & m_sProxyPass) & vbCrLf
+    End If
+    sReq = sReq & vbCrLf
+    '--- Send via raw socket (no TLS yet)
+    Dim baSend() As Byte
+    baSend = pvToAcpArray(sReq)
+    pvRawSend baSend
+    '--- Now wait for response in pvOnReceive -> pvDispatchReceivedData -> pvProxyOnResponse
+    m_sProxyRecvBuf = vbNullString
+    Exit Sub
+EH:
+    PrintError FUNC_NAME
+End Sub
+
+Private Sub pvProxyOnResponse()
+    Const FUNC_NAME As String = "pvProxyOnResponse"
+    On Error GoTo EH
+    '--- Accumulate response
+    Dim sChunk As String
+    sChunk = pvFromAcpArray(m_baRecvBuffer)
+    m_baRecvBuffer = vbNullString
+    m_sProxyRecvBuf = m_sProxyRecvBuf & sChunk
+    '--- Check for complete headers
+    Dim lEnd As Long
+    lEnd = InStr(m_sProxyRecvBuf, vbCrLf & vbCrLf)
+    If lEnd = 0 Then Exit Sub  '--- Need more data
+    '--- Parse status code
+    Dim lSpace As Long, lSpace2 As Long
+    Dim lStatus As Long
+    lSpace = InStr(m_sProxyRecvBuf, " ")
+    If lSpace > 0 Then
+        lSpace2 = InStr(lSpace + 1, m_sProxyRecvBuf, " ")
+        If lSpace2 > 0 Then
+            lStatus = CLng(Mid$(m_sProxyRecvBuf, lSpace + 1, lSpace2 - lSpace - 1))
+        End If
+    End If
+    m_sProxyRecvBuf = vbNullString
+    m_bProxyConnecting = False
+    If lStatus = 200 Then
+        '--- Tunnel established! Now proceed with TLS handshake or direct connection
+        If m_eProtocol = sckTLSProtocol Then
+            pvTlsBeginHandshake
+        Else
+            m_bConnecting = False
+            pvState = sckConnected
+            pvPostConnectActions
+            RaiseEvent Connect
+        End If
+    Else
+        '--- Proxy refused connection
+        pvSetError LastDllError:=sckConnectionRefused
+    End If
+    Exit Sub
+EH:
+    PrintError FUNC_NAME
+End Sub
+
+Private Function pvBase64EncodeSimple(sText As String) As String
+    '--- Simple Base64 encode for proxy auth (reuse pvToAcpArray + pvBase64Encode)
+    Dim baInput() As Byte
+    baInput = pvToAcpArray(sText)
+    pvBase64EncodeSimple = pvBase64Encode(baInput)
+End Function
+
+'=========================================================================
+' Private - Segmented Download Engine
+'=========================================================================
+
+Private Sub pvSegStart(sUrl As String, sSavePath As String, sExtraHeaders As String)
+    Const FUNC_NAME As String = "pvSegStart"
+    On Error GoTo EH
+    '--- Parse URL
+    Dim sScheme As String
+    pvParseUrl sUrl, sScheme, m_sSegHost, m_lSegPort, m_sSegPath
+    m_bSegUseTls = (LCase$(sScheme) = "https")
+    m_sSegUrl = sUrl
+    m_sSegSavePath = sSavePath
+    m_sSegExtraHeaders = sExtraHeaders
+    '--- Phase 1: Send HEAD request via main socket to check server capabilities
+    m_bSegHeadPhase = True
+    m_dSegStartTime = Timer
+    '--- Use the main socket to do a HEAD request
+    If m_bSegUseTls Then
+        m_eProtocol = sckTLSProtocol
+    Else
+        m_eProtocol = sckTCPProtocol
+    End If
+    '--- Build HEAD request
+    Dim sReq As String
+    sReq = "HEAD " & m_sSegPath & " HTTP/1.1" & vbCrLf & _
+           "Host: " & m_sSegHost & vbCrLf
+    If LenB(sExtraHeaders) <> 0 Then
+        sReq = sReq & sExtraHeaders & vbCrLf
+    End If
+    sReq = sReq & "Connection: close" & vbCrLf & vbCrLf
+    '--- Connect and send
+    Connect m_sSegHost, m_lSegPort
+    m_lHttpState = HTTP_WAITING
+    m_sHttpRawResponse = vbNullString
+    m_lHttpStatus = 0
+    m_sHttpHeaders = vbNullString
+    m_sHttpContentType = vbNullString
+    m_lHttpContentLength = -1
+    m_bHttpChunked = False
+    m_dTransferStart = Timer
+    m_sHttpBody = sReq
+    Exit Sub
+EH:
+    m_bSegHeadPhase = False
+    PrintError FUNC_NAME
+End Sub
+
+Private Sub pvSegOnHeadResponse(ByVal lStatus As Long, sHeaders As String)
+    Const FUNC_NAME As String = "pvSegOnHeadResponse"
+    On Error GoTo EH
+    m_bSegHeadPhase = False
+    '--- Check if server supports Range requests
+    Dim sAcceptRanges As String
+    sAcceptRanges = pvHttpGetHeader(sHeaders, "Accept-Ranges")
+    Dim sCL As String
+    sCL = pvHttpGetHeader(sHeaders, "Content-Length")
+    Dim lFileSize As Long
+    If LenB(sCL) <> 0 Then lFileSize = CLng(sCL)
+    '--- If server supports Range and file size is known, use segmented download
+    If InStr(1, sAcceptRanges, "bytes", vbTextCompare) > 0 And lFileSize > 0 Then
+        m_lSegFileSize = lFileSize
+        '--- Determine actual segment count (at least 1KB per segment)
+        m_lSegCount = m_lDownloadSegments
+        If m_lSegCount > m_lSegFileSize \ 1024 Then m_lSegCount = m_lSegFileSize \ 1024
+        If m_lSegCount < 1 Then m_lSegCount = 1
+        If m_lSegCount = 1 Then
+            '--- File too small for segmenting, fallback to single
+            GoTo FallbackSingle
+        End If
+        '--- Create output file with full size
+        Dim lFh As Integer
+        lFh = FreeFile
+        Open m_sSegSavePath For Binary Access Write As #lFh
+        '--- Pre-allocate by seeking to end
+        Dim baZero(0) As Byte
+        baZero(0) = 0
+        Seek #lFh, m_lSegFileSize
+        Put #lFh, , baZero(0)
+        Close #lFh
+        m_lSegFileHandle = FreeFile
+        Open m_sSegSavePath For Binary Access Read Write As #m_lSegFileHandle
+        '--- Calculate segment ranges
+        ReDim m_lSegStatus(0 To m_lSegCount - 1)
+        ReDim m_lSegStartByte(0 To m_lSegCount - 1)
+        ReDim m_lSegEndByte(0 To m_lSegCount - 1)
+        ReDim m_lSegBytesRecv(0 To m_lSegCount - 1)
+        ReDim m_lSegRetryCount(0 To m_lSegCount - 1)
+        ReDim m_hSegSocket(0 To m_lSegCount - 1)
+        ReDim m_hSegEvent(0 To m_lSegCount - 1)
+        ReDim m_hSegCred(0 To m_lSegCount * 2 - 1)
+        ReDim m_hSegCtx(0 To m_lSegCount * 2 - 1)
+        ReDim m_bSegHasCred(0 To m_lSegCount - 1)
+        ReDim m_bSegHasCtx(0 To m_lSegCount - 1)
+        ReDim m_uSegStreamSizes(0 To m_lSegCount - 1)
+        ReDim m_baSegTlsPending(0 To m_lSegCount - 1)
+        ReDim m_lSegTlsState(0 To m_lSegCount - 1)
+        ReDim m_bSegHeadersDone(0 To m_lSegCount - 1)
+        ReDim m_sSegRawHeader(0 To m_lSegCount - 1)
+        ReDim m_sSegRecvBuf(0 To m_lSegCount - 1)
+        Dim lSegSize As Long
+        lSegSize = m_lSegFileSize \ m_lSegCount
+        Dim i As Long
+        For i = 0 To m_lSegCount - 1
+            m_lSegStartByte(i) = i * lSegSize
+            If i = m_lSegCount - 1 Then
+                m_lSegEndByte(i) = m_lSegFileSize - 1
+            Else
+                m_lSegEndByte(i) = (i + 1) * lSegSize - 1
+            End If
+            m_lSegBytesRecv(i) = 0
+            m_hSegSocket(i) = INVALID_SOCKET
+            m_hSegEvent(i) = 0
+            m_lSegTlsState(i) = TLS_NONE
+            m_bSegHeadersDone(i) = False
+            m_sSegRawHeader(i) = vbNullString
+            m_sSegRecvBuf(i) = vbNullString
+            m_baSegTlsPending(i) = Empty
+        Next
+        '--- Start all segment connections
+        m_bSegActive = True
+        m_lSegTotalRecv = 0
+        m_lSegDoneCount = 0
+        m_dSegStartTime = Timer
+        For i = 0 To m_lSegCount - 1
+            pvSegCreateSocket i
+        Next
+        '--- Ensure timer keeps running for segment polling
+        tmrPoll.Enabled = True
+    Else
+FallbackSingle:
+        '--- Fallback to single connection download
+        Dim lOldSeg As Long
+        lOldSeg = m_lDownloadSegments
+        m_lDownloadSegments = 1
+        Download m_sSegUrl, m_sSegSavePath, m_sSegExtraHeaders
+        m_lDownloadSegments = lOldSeg
+    End If
+    Exit Sub
+EH:
+    PrintError FUNC_NAME
+End Sub
+
+Private Sub pvSegCreateSocket(ByVal lIdx As Long)
+    Const FUNC_NAME As String = "pvSegCreateSocket"
+    On Error GoTo EH
+    '--- Resolve host
+    Dim lAddr As Long
+    If LenB(m_sProxyHost) <> 0 Then
+        lAddr = pvResolveHost(m_sProxyHost)
+    Else
+        lAddr = pvResolveHost(m_sSegHost)
+    End If
+    If lAddr = INADDR_NONE Then
+        m_lSegStatus(lIdx) = SEG_ERROR
+        Exit Sub
+    End If
+    '--- Create socket
+    m_hSegSocket(lIdx) = ws_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
+    If m_hSegSocket(lIdx) = INVALID_SOCKET Then
+        m_lSegStatus(lIdx) = SEG_ERROR
+        Exit Sub
+    End If
+    '--- Create WSA event
+    m_hSegEvent(lIdx) = WSACreateEvent()
+    If m_hSegEvent(lIdx) = 0 Then
+        ws_closesocket m_hSegSocket(lIdx)
+        m_hSegSocket(lIdx) = INVALID_SOCKET
+        m_lSegStatus(lIdx) = SEG_ERROR
+        Exit Sub
+    End If
+    '--- Register for events
+    WSAEventSelect m_hSegSocket(lIdx), m_hSegEvent(lIdx), FD_CONNECT Or FD_READ Or FD_WRITE Or FD_CLOSE
+    '--- Connect
+    m_lSegStatus(lIdx) = SEG_CONNECTING
+    Dim uAddr As SOCKADDR_IN
+    uAddr.sin_family = AF_INET
+    uAddr.sin_addr = lAddr
+    If LenB(m_sProxyHost) <> 0 Then
+        uAddr.sin_port = ws_htons(m_lProxyPort)
+    Else
+        uAddr.sin_port = ws_htons(m_lSegPort)
+    End If
+    Dim lResult As Long
+    lResult = ws_connect(m_hSegSocket(lIdx), uAddr, LenB(uAddr))
+    If lResult = SOCKET_ERROR Then
+        Dim lErr As Long
+        lErr = WSAGetLastError()
+        If lErr <> WSAEWOULDBLOCK Then
+            m_lSegStatus(lIdx) = SEG_ERROR
+        End If
+    End If
+    Exit Sub
+EH:
+    m_lSegStatus(lIdx) = SEG_ERROR
+    PrintError FUNC_NAME
+End Sub
+
+Private Sub pvSegSendRequest(ByVal lIdx As Long)
+    Const FUNC_NAME As String = "pvSegSendRequest"
+    On Error GoTo EH
+    '--- Build GET request with Range header
+    Dim sReq As String
+    sReq = "GET " & m_sSegPath & " HTTP/1.1" & vbCrLf & _
+           "Host: " & m_sSegHost & vbCrLf & _
+           "Range: bytes=" & (m_lSegStartByte(lIdx) + m_lSegBytesRecv(lIdx)) & "-" & m_lSegEndByte(lIdx) & vbCrLf
+    If LenB(m_sSegExtraHeaders) <> 0 Then
+        sReq = sReq & m_sSegExtraHeaders & vbCrLf
+    End If
+    sReq = sReq & "Connection: close" & vbCrLf & vbCrLf
+    '--- Send
+    Dim baSend() As Byte
+    baSend = pvToAcpArray(sReq)
+    If m_bSegUseTls And m_lSegTlsState(lIdx) = TLS_CONNECTED Then
+        '--- Encrypt and send
+        Dim baEnc() As Byte
+        pvSegTlsEncrypt lIdx, baSend, baEnc
+        pvSegRawSend lIdx, baEnc
+    Else
+        pvSegRawSend lIdx, baSend
+    End If
+    m_lSegStatus(lIdx) = SEG_DOWNLOADING
+    m_bSegHeadersDone(lIdx) = False
+    m_sSegRawHeader(lIdx) = vbNullString
+    Exit Sub
+EH:
+    m_lSegStatus(lIdx) = SEG_ERROR
+    PrintError FUNC_NAME
+End Sub
+
+Private Sub pvSegRawSend(ByVal lIdx As Long, baData() As Byte)
+    Dim lSize As Long
+    lSize = pvArraySize(baData)
+    If lSize = 0 Then Exit Sub
+    Dim lPos As Long, lSent As Long
+    lPos = 0
+    Do While lPos < lSize
+        lSent = ws_send(m_hSegSocket(lIdx), baData(lPos), lSize - lPos, 0)
+        If lSent = SOCKET_ERROR Then
+            If WSAGetLastError() = WSAEWOULDBLOCK Then
+                Dim dStart As Double
+                dStart = Timer
+                Do
+                    DoEvents
+                    If Timer - dStart > 5# Then Exit Sub
+                    lSent = ws_send(m_hSegSocket(lIdx), baData(lPos), lSize - lPos, 0)
+                    If lSent <> SOCKET_ERROR Then Exit Do
+                    If WSAGetLastError() <> WSAEWOULDBLOCK Then Exit Sub
+                Loop
+            Else
+                Exit Sub
+            End If
+        End If
+        If lSent > 0 Then lPos = lPos + lSent
+    Loop
+End Sub
+
+Private Sub pvPollSegments()
+    Const FUNC_NAME As String = "pvPollSegments"
+    On Error GoTo EH
+    If Not m_bSegActive Then Exit Sub
+    Dim i As Long
+    For i = 0 To m_lSegCount - 1
+        If m_lSegStatus(i) = SEG_CONNECTING Or m_lSegStatus(i) = SEG_DOWNLOADING Then
+            If m_hSegEvent(i) = 0 Then GoTo NextSeg
+            '--- Check WSA event
+            Dim lWait As Long
+            lWait = WSAWaitForMultipleEvents(1, m_hSegEvent(i), 0, 0, 0)
+            If lWait <> WSA_WAIT_EVENT_0 Then GoTo NextSeg
+            Dim uNE As WSANETWORKEVENTS_TYPE
+            If WSAEnumNetworkEvents(m_hSegSocket(i), m_hSegEvent(i), uNE) = SOCKET_ERROR Then GoTo NextSeg
+            '--- FD_CONNECT
+            If (uNE.lNetworkEvents And FD_CONNECT) <> 0 Then
+                If uNE.iErrorCode(FD_CONNECT_BIT) <> 0 Then
+                    m_lSegStatus(i) = SEG_ERROR
+                    GoTo NextSeg
+                End If
+                '--- Connected! Start TLS or send request
+                If m_bSegUseTls Then
+                    pvSegTlsBegin i
+                Else
+                    pvSegSendRequest i
+                End If
+            End If
+            '--- FD_READ
+            If (uNE.lNetworkEvents And FD_READ) <> 0 Then
+                If uNE.iErrorCode(FD_READ_BIT) = 0 Then
+                    pvSegOnReceive i
+                End If
+            End If
+            '--- FD_CLOSE
+            If (uNE.lNetworkEvents And FD_CLOSE) <> 0 Then
+                '--- Check if we got all expected data
+                Dim lExpected As Long
+                lExpected = m_lSegEndByte(i) - m_lSegStartByte(i) + 1
+                If m_lSegBytesRecv(i) >= lExpected Then
+                    m_lSegStatus(i) = SEG_DONE
+                    m_lSegDoneCount = m_lSegDoneCount + 1
+                Else
+                    '--- Try to read remaining data first
+                    pvSegOnReceive i
+                    If m_lSegBytesRecv(i) >= lExpected Then
+                        m_lSegStatus(i) = SEG_DONE
+                        m_lSegDoneCount = m_lSegDoneCount + 1
+                    Else
+                        m_lSegStatus(i) = SEG_ERROR
+                    End If
+                End If
+            End If
+        ElseIf m_lSegStatus(i) = SEG_ERROR Then
+            '--- Retry logic
+            If m_lSegRetryCount(i) < SEG_MAX_RETRIES Then
+                m_lSegRetryCount(i) = m_lSegRetryCount(i) + 1
+                pvSegCloseSocket i
+                pvSegCreateSocket i
+            End If
+        End If
+NextSeg:
+    Next
+    '--- Update progress
+    pvSegUpdateProgress
+    '--- Check completion
+    pvSegCheckComplete
+    Exit Sub
+EH:
+    PrintError FUNC_NAME
+End Sub
+
+Private Sub pvSegOnReceive(ByVal lIdx As Long)
+    Const FUNC_NAME As String = "pvSegOnReceive"
+    On Error GoTo EH
+    Dim baBuffer() As Byte
+    Dim lRecv As Long
+    Do
+        '--- Bandwidth throttling for segments
+        Dim lMaxRecv As Long
+        lMaxRecv = RECV_BUFFER_SIZE
+        If m_lMaxBandwidth > 0 Then
+            If Timer - m_dBwLastReset >= 1# Then
+                m_lBwBytesThisSec = 0
+                m_dBwLastReset = Timer
+            End If
+            Dim lBudget As Long
+            lBudget = (m_lMaxBandwidth \ m_lSegCount) - m_lBwBytesThisSec
+            If lBudget <= 0 Then Exit Do
+            If lBudget < lMaxRecv Then lMaxRecv = lBudget
+        End If
+        ReDim baBuffer(0 To lMaxRecv - 1)
+        lRecv = ws_recv(m_hSegSocket(lIdx), baBuffer(0), lMaxRecv, 0)
+        If lRecv = SOCKET_ERROR Then Exit Do
+        If lRecv = 0 Then Exit Do
+        ReDim Preserve baBuffer(0 To lRecv - 1)
+        If m_lMaxBandwidth > 0 Then m_lBwBytesThisSec = m_lBwBytesThisSec + lRecv
+        '--- Process TLS if active
+        If m_bSegUseTls And m_lSegTlsState(lIdx) = TLS_HANDSHAKE Then
+            pvSegTlsHandshakeStep lIdx, baBuffer
+            Exit Do
+        ElseIf m_bSegUseTls And m_lSegTlsState(lIdx) = TLS_CONNECTED Then
+            '--- Decrypt TLS data
+            Dim sDecrypted As String
+            sDecrypted = pvSegTlsDecrypt(lIdx, baBuffer)
+            If LenB(sDecrypted) = 0 Then Exit Do
+            m_sSegRecvBuf(lIdx) = m_sSegRecvBuf(lIdx) & sDecrypted
+        Else
+            '--- Plain TCP
+            m_sSegRecvBuf(lIdx) = m_sSegRecvBuf(lIdx) & pvFromAcpArray(baBuffer)
+        End If
+        '--- Parse HTTP headers if not done yet
+        If Not m_bSegHeadersDone(lIdx) Then
+            Dim lHdrEnd As Long
+            lHdrEnd = InStr(m_sSegRecvBuf(lIdx), vbCrLf & vbCrLf)
+            If lHdrEnd > 0 Then
+                m_bSegHeadersDone(lIdx) = True
+                '--- Extract body after headers
+                Dim sBody As String
+                sBody = Mid$(m_sSegRecvBuf(lIdx), lHdrEnd + 4)
+                m_sSegRecvBuf(lIdx) = vbNullString
+                '--- Write body data to file
+                If LenB(sBody) > 0 Then
+                    pvSegWriteData lIdx, sBody
+                End If
+            End If
+        Else
+            '--- Headers already done, all recv data is body
+            If LenB(m_sSegRecvBuf(lIdx)) > 0 Then
+                pvSegWriteData lIdx, m_sSegRecvBuf(lIdx)
+                m_sSegRecvBuf(lIdx) = vbNullString
+            End If
+        End If
+        '--- Check if segment is complete
+        Dim lExpected As Long
+        lExpected = m_lSegEndByte(lIdx) - m_lSegStartByte(lIdx) + 1
+        If m_lSegBytesRecv(lIdx) >= lExpected Then
+            m_lSegStatus(lIdx) = SEG_DONE
+            m_lSegDoneCount = m_lSegDoneCount + 1
+            Exit Do
+        End If
+    Loop
+    Exit Sub
+EH:
+    PrintError FUNC_NAME
+End Sub
+
+Private Sub pvSegWriteData(ByVal lIdx As Long, sData As String)
+    On Error GoTo EH
+    Dim baData() As Byte
+    baData = pvToAcpArray(sData)
+    Dim lSize As Long
+    lSize = pvArraySize(baData)
+    If lSize = 0 Then Exit Sub
+    '--- Calculate file offset: segment start + bytes already received
+    Dim lOffset As Long
+    lOffset = m_lSegStartByte(lIdx) + m_lSegBytesRecv(lIdx)
+    '--- Write at offset (VB6 Seek is 1-based)
+    Seek #m_lSegFileHandle, lOffset + 1
+    Put #m_lSegFileHandle, , baData
+    m_lSegBytesRecv(lIdx) = m_lSegBytesRecv(lIdx) + lSize
+    m_lSegTotalRecv = m_lSegTotalRecv + lSize
+    Exit Sub
+EH:
+    PrintError "pvSegWriteData"
+End Sub
+
+Private Sub pvSegUpdateProgress()
+    If Not m_bSegActive Then Exit Sub
+    Dim dElapsed As Double
+    dElapsed = Timer - m_dSegStartTime
+    If dElapsed < 0 Then dElapsed = dElapsed + 86400#
+    Dim lSpeed As Long
+    If dElapsed > 0.01 Then
+        lSpeed = CLng(CDbl(m_lSegTotalRecv) / dElapsed)
+    End If
+    Dim lETA As Long
+    If lSpeed > 0 And m_lSegFileSize > m_lSegTotalRecv Then
+        lETA = CLng(CDbl(m_lSegFileSize - m_lSegTotalRecv) / CDbl(lSpeed))
+    End If
+    RaiseEvent Progress(m_lSegTotalRecv, m_lSegFileSize, lSpeed, lETA)
+End Sub
+
+Private Sub pvSegCheckComplete()
+    If Not m_bSegActive Then Exit Sub
+    '--- Check if all segments are done
+    If m_lSegDoneCount >= m_lSegCount Then
+        '--- All done!
+        Close #m_lSegFileHandle
+        m_lSegFileHandle = 0
+        Dim sSavePath As String
+        sSavePath = m_sSegSavePath
+        '--- Clear state file
+        ClearDownloadState
+        '--- Cleanup
+        pvSegCleanup
+        '--- Fire completion event
+        RaiseEvent Response(206, "application/octet-stream", sSavePath, vbNullString)
+        Exit Sub
+    End If
+    '--- Check if all non-done segments have permanently failed
+    Dim i As Long
+    Dim bAllFailed As Boolean
+    bAllFailed = True
+    For i = 0 To m_lSegCount - 1
+        If m_lSegStatus(i) <> SEG_DONE And m_lSegStatus(i) <> SEG_ERROR Then
+            bAllFailed = False
+            Exit For
+        End If
+        If m_lSegStatus(i) = SEG_ERROR And m_lSegRetryCount(i) < SEG_MAX_RETRIES Then
+            bAllFailed = False
+            Exit For
+        End If
+    Next
+    If bAllFailed Then
+        pvSegCleanup
+        pvSetError LastDllError:=sckConnectionReset
+    End If
+End Sub
+
+Private Sub pvSegCloseSocket(ByVal lIdx As Long)
+    On Error Resume Next
+    '--- Close TLS context for this segment
+    If m_bSegHasCtx(lIdx) Then
+        DeleteSecurityContext m_hSegCtx(lIdx * 2)
+        m_hSegCtx(lIdx * 2) = 0
+        m_hSegCtx(lIdx * 2 + 1) = 0
+        m_bSegHasCtx(lIdx) = False
+    End If
+    If m_bSegHasCred(lIdx) Then
+        FreeCredentialsHandle m_hSegCred(lIdx * 2)
+        m_hSegCred(lIdx * 2) = 0
+        m_hSegCred(lIdx * 2 + 1) = 0
+        m_bSegHasCred(lIdx) = False
+    End If
+    m_lSegTlsState(lIdx) = TLS_NONE
+    '--- Close socket and event
+    If m_hSegSocket(lIdx) <> INVALID_SOCKET And m_hSegSocket(lIdx) <> 0 Then
+        ws_closesocket m_hSegSocket(lIdx)
+        m_hSegSocket(lIdx) = INVALID_SOCKET
+    End If
+    If m_hSegEvent(lIdx) <> 0 Then
+        WSACloseEvent m_hSegEvent(lIdx)
+        m_hSegEvent(lIdx) = 0
+    End If
+    m_bSegHeadersDone(lIdx) = False
+    m_sSegRawHeader(lIdx) = vbNullString
+    m_sSegRecvBuf(lIdx) = vbNullString
+    m_baSegTlsPending(lIdx) = Empty
+    On Error GoTo 0
+End Sub
+
+Private Sub pvSegCleanup()
+    On Error Resume Next
+    Dim i As Long
+    If m_lSegCount > 0 Then
+        For i = 0 To m_lSegCount - 1
+            pvSegCloseSocket i
+        Next
+    End If
+    '--- Close file
+    If m_lSegFileHandle <> 0 Then
+        Close #m_lSegFileHandle
+        m_lSegFileHandle = 0
+    End If
+    m_bSegActive = False
+    m_bSegHeadPhase = False
+    m_lSegCount = 0
+    m_lSegDoneCount = 0
+    m_lSegTotalRecv = 0
+    m_lSegFileSize = 0
+    On Error GoTo 0
+End Sub
+
+'--- Segment TLS helpers (simplified - reuse main Schannel APIs)
+Private Sub pvSegTlsBegin(ByVal lIdx As Long)
+    Const FUNC_NAME As String = "pvSegTlsBegin"
+    On Error GoTo EH
+    '--- Acquire credentials
+    Dim uCred As SCHANNEL_CRED
+    uCred.dwVersion = SCHANNEL_CRED_VERSION
+    uCred.dwFlags = SCH_CRED_NO_DEFAULT_CREDS Or SCH_CRED_MANUAL_CRED_VALIDATION
+    uCred.grbitEnabledProtocols = SP_PROT_TLS1_2 Or SP_PROT_TLS1_3
+    Dim tsExpiry As Currency
+    Dim lResult As Long
+    lResult = AcquireCredentialsHandle(0, UNISP_NAME, SECPKG_CRED_OUTBOUND, 0, uCred, 0, 0, _
+              m_hSegCred(lIdx * 2), tsExpiry)
+    If lResult <> SEC_E_OK Then
+        m_lSegStatus(lIdx) = SEG_ERROR
+        Exit Sub
+    End If
+    m_bSegHasCred(lIdx) = True
+    m_lSegTlsState(lIdx) = TLS_HANDSHAKE
+    m_baSegTlsPending(lIdx) = Empty
+    '--- Initial handshake step (empty input)
+    Dim uOutBuf(0) As SecBuffer
+    uOutBuf(0).BufferType = SECBUFFER_TOKEN
+    uOutBuf(0).cbBuffer = 0
+    uOutBuf(0).pvBuffer = 0
+    Dim uOutDesc As SecBufferDesc
+    uOutDesc.ulVersion = SECBUFFER_VERSION
+    uOutDesc.cBuffers = 1
+    uOutDesc.pBuffers = VarPtr(uOutBuf(0))
+    Dim lFlags As Long, lAttr As Long
+    lFlags = ISC_REQ_SEQUENCE_DETECT Or ISC_REQ_REPLAY_DETECT Or ISC_REQ_CONFIDENTIALITY Or _
+             ISC_REQ_ALLOCATE_MEMORY Or ISC_REQ_STREAM
+    lResult = InitializeSecurityContext(m_hSegCred(lIdx * 2), ByVal 0&, m_sSegHost, lFlags, 0, 0, _
+              ByVal 0&, 0, m_hSegCtx(lIdx * 2), uOutDesc, lAttr, tsExpiry)
+    If lResult = SEC_I_CONTINUE_NEEDED Then
+        m_bSegHasCtx(lIdx) = True
+        If uOutBuf(0).cbBuffer > 0 And uOutBuf(0).pvBuffer <> 0 Then
+            Dim baSend() As Byte
+            ReDim baSend(0 To uOutBuf(0).cbBuffer - 1)
+            CopyMemory baSend(0), ByVal uOutBuf(0).pvBuffer, uOutBuf(0).cbBuffer
+            FreeContextBuffer uOutBuf(0).pvBuffer
+            pvSegRawSend lIdx, baSend
+        End If
+    Else
+        m_lSegStatus(lIdx) = SEG_ERROR
+    End If
+    Exit Sub
+EH:
+    m_lSegStatus(lIdx) = SEG_ERROR
+    PrintError FUNC_NAME
+End Sub
+
+Private Sub pvSegTlsHandshakeStep(ByVal lIdx As Long, baInput() As Byte)
+    Const FUNC_NAME As String = "pvSegTlsHandshakeStep"
+    On Error GoTo EH
+    '--- Append input to pending
+    If IsEmpty(m_baSegTlsPending(lIdx)) Then
+        m_baSegTlsPending(lIdx) = baInput
+    Else
+        Dim baOld() As Byte
+        baOld = m_baSegTlsPending(lIdx)
+        pvAppendBuffer baOld, baInput
+        m_baSegTlsPending(lIdx) = baOld
+    End If
+    Dim baPending() As Byte
+    baPending = m_baSegTlsPending(lIdx)
+    Dim lPendSize As Long
+    lPendSize = pvArraySize(baPending)
+    If lPendSize = 0 Then Exit Sub
+    '--- Setup input buffers
+    Dim uInBuf(0 To 1) As SecBuffer
+    uInBuf(0).BufferType = SECBUFFER_TOKEN
+    uInBuf(0).cbBuffer = lPendSize
+    uInBuf(0).pvBuffer = VarPtr(baPending(0))
+    uInBuf(1).BufferType = SECBUFFER_EMPTY
+    uInBuf(1).cbBuffer = 0
+    uInBuf(1).pvBuffer = 0
+    Dim uInDesc As SecBufferDesc
+    uInDesc.ulVersion = SECBUFFER_VERSION
+    uInDesc.cBuffers = 2
+    uInDesc.pBuffers = VarPtr(uInBuf(0))
+    '--- Output
+    Dim uOutBuf(0) As SecBuffer
+    uOutBuf(0).BufferType = SECBUFFER_TOKEN
+    uOutBuf(0).cbBuffer = 0
+    uOutBuf(0).pvBuffer = 0
+    Dim uOutDesc As SecBufferDesc
+    uOutDesc.ulVersion = SECBUFFER_VERSION
+    uOutDesc.cBuffers = 1
+    uOutDesc.pBuffers = VarPtr(uOutBuf(0))
+    Dim lFlags As Long, lAttr As Long
+    Dim tsExpiry As Currency
+    lFlags = ISC_REQ_SEQUENCE_DETECT Or ISC_REQ_REPLAY_DETECT Or ISC_REQ_CONFIDENTIALITY Or _
+             ISC_REQ_ALLOCATE_MEMORY Or ISC_REQ_STREAM
+    Dim lResult As Long
+    lResult = InitializeSecurityContext(m_hSegCred(lIdx * 2), m_hSegCtx(lIdx * 2), m_sSegHost, lFlags, 0, 0, _
+              uInDesc, 0, m_hSegCtx(lIdx * 2), uOutDesc, lAttr, tsExpiry)
+    '--- Send output token if any
+    If uOutBuf(0).cbBuffer > 0 And uOutBuf(0).pvBuffer <> 0 Then
+        Dim baSend() As Byte
+        ReDim baSend(0 To uOutBuf(0).cbBuffer - 1)
+        CopyMemory baSend(0), ByVal uOutBuf(0).pvBuffer, uOutBuf(0).cbBuffer
+        FreeContextBuffer uOutBuf(0).pvBuffer
+        pvSegRawSend lIdx, baSend
+    End If
+    '--- Handle extra data
+    If uInBuf(1).BufferType = SECBUFFER_EXTRA And uInBuf(1).cbBuffer > 0 Then
+        Dim baExtra() As Byte
+        ReDim baExtra(0 To uInBuf(1).cbBuffer - 1)
+        CopyMemory baExtra(0), baPending(lPendSize - uInBuf(1).cbBuffer), uInBuf(1).cbBuffer
+        m_baSegTlsPending(lIdx) = baExtra
+    Else
+        m_baSegTlsPending(lIdx) = Empty
+    End If
+    Select Case lResult
+    Case SEC_E_OK
+        '--- Handshake complete!
+        m_lSegTlsState(lIdx) = TLS_CONNECTED
+        QueryContextAttributes m_hSegCtx(lIdx * 2), SECPKG_ATTR_STREAM_SIZES, m_uSegStreamSizes(lIdx)
+        '--- Send HTTP request
+        pvSegSendRequest lIdx
+    Case SEC_I_CONTINUE_NEEDED, SEC_E_INCOMPLETE_MESSAGE
+        '--- Need more data, keep waiting
+    Case Else
+        m_lSegStatus(lIdx) = SEG_ERROR
+    End Select
+    Exit Sub
+EH:
+    m_lSegStatus(lIdx) = SEG_ERROR
+    PrintError FUNC_NAME
+End Sub
+
+Private Sub pvSegTlsEncrypt(ByVal lIdx As Long, baPlain() As Byte, baOut() As Byte)
+    On Error GoTo EH
+    Dim lPlainSize As Long
+    lPlainSize = pvArraySize(baPlain)
+    If lPlainSize = 0 Then Exit Sub
+    Dim lHdr As Long, lTrl As Long, lMax As Long
+    lHdr = m_uSegStreamSizes(lIdx).cbHeader
+    lTrl = m_uSegStreamSizes(lIdx).cbTrailer
+    lMax = m_uSegStreamSizes(lIdx).cbMaximumMessage
+    If lPlainSize > lMax Then lPlainSize = lMax
+    ReDim baOut(0 To lHdr + lPlainSize + lTrl - 1)
+    CopyMemory baOut(lHdr), baPlain(0), lPlainSize
+    Dim uBuf(0 To 3) As SecBuffer
+    uBuf(0).BufferType = SECBUFFER_STREAM_HEADER
+    uBuf(0).cbBuffer = lHdr
+    uBuf(0).pvBuffer = VarPtr(baOut(0))
+    uBuf(1).BufferType = SECBUFFER_DATA
+    uBuf(1).cbBuffer = lPlainSize
+    uBuf(1).pvBuffer = VarPtr(baOut(lHdr))
+    uBuf(2).BufferType = SECBUFFER_STREAM_TRAILER
+    uBuf(2).cbBuffer = lTrl
+    uBuf(2).pvBuffer = VarPtr(baOut(lHdr + lPlainSize))
+    uBuf(3).BufferType = SECBUFFER_EMPTY
+    Dim uDesc As SecBufferDesc
+    uDesc.ulVersion = SECBUFFER_VERSION
+    uDesc.cBuffers = 4
+    uDesc.pBuffers = VarPtr(uBuf(0))
+    If EncryptMessage(m_hSegCtx(lIdx * 2), 0, uDesc, 0) <> SEC_E_OK Then
+        baOut = vbNullString
+    Else
+        ReDim Preserve baOut(0 To uBuf(0).cbBuffer + uBuf(1).cbBuffer + uBuf(2).cbBuffer - 1)
+    End If
+    Exit Sub
+EH:
+    baOut = vbNullString
+End Sub
+
+Private Function pvSegTlsDecrypt(ByVal lIdx As Long, baInput() As Byte) As String
+    On Error GoTo EH
+    '--- Append to pending
+    Dim baPending() As Byte
+    If Not IsEmpty(m_baSegTlsPending(lIdx)) Then
+        baPending = m_baSegTlsPending(lIdx)
+        pvAppendBuffer baPending, baInput
+    Else
+        baPending = baInput
+    End If
+    Dim sResult As String
+    sResult = vbNullString
+    Do
+        Dim lPendSize As Long
+        lPendSize = pvArraySize(baPending)
+        If lPendSize = 0 Then Exit Do
+        Dim uBuf(0 To 3) As SecBuffer
+        uBuf(0).BufferType = SECBUFFER_DATA
+        uBuf(0).cbBuffer = lPendSize
+        uBuf(0).pvBuffer = VarPtr(baPending(0))
+        uBuf(1).BufferType = SECBUFFER_EMPTY
+        uBuf(2).BufferType = SECBUFFER_EMPTY
+        uBuf(3).BufferType = SECBUFFER_EMPTY
+        Dim uDesc As SecBufferDesc
+        uDesc.ulVersion = SECBUFFER_VERSION
+        uDesc.cBuffers = 4
+        uDesc.pBuffers = VarPtr(uBuf(0))
+        Dim lResult As Long
+        lResult = DecryptMessage(m_hSegCtx(lIdx * 2), uDesc, 0, 0)
+        If lResult = SEC_E_OK Then
+            '--- Find DATA buffer
+            Dim j As Long
+            For j = 0 To 3
+                If uBuf(j).BufferType = SECBUFFER_DATA And uBuf(j).cbBuffer > 0 Then
+                    Dim baDecrypted() As Byte
+                    ReDim baDecrypted(0 To uBuf(j).cbBuffer - 1)
+                    CopyMemory baDecrypted(0), ByVal uBuf(j).pvBuffer, uBuf(j).cbBuffer
+                    sResult = sResult & pvFromAcpArray(baDecrypted)
+                End If
+            Next
+            '--- Check for EXTRA data
+            Dim bHasExtra As Boolean
+            bHasExtra = False
+            For j = 0 To 3
+                If uBuf(j).BufferType = SECBUFFER_EXTRA And uBuf(j).cbBuffer > 0 Then
+                    Dim baExtra() As Byte
+                    ReDim baExtra(0 To uBuf(j).cbBuffer - 1)
+                    CopyMemory baExtra(0), baPending(lPendSize - uBuf(j).cbBuffer), uBuf(j).cbBuffer
+                    baPending = baExtra
+                    bHasExtra = True
+                    Exit For
+                End If
+            Next
+            If Not bHasExtra Then
+                m_baSegTlsPending(lIdx) = Empty
+                Exit Do
+            End If
+        ElseIf lResult = SEC_E_INCOMPLETE_MESSAGE Then
+            '--- Need more data
+            m_baSegTlsPending(lIdx) = baPending
+            Exit Do
+        Else
+            m_baSegTlsPending(lIdx) = Empty
+            Exit Do
+        End If
+    Loop
+    pvSegTlsDecrypt = sResult
+    Exit Function
+EH:
+    pvSegTlsDecrypt = vbNullString
+End Function
+
+'=========================================================================
+' Public - State Persistence
+'=========================================================================
+
+Public Sub SaveDownloadState(Optional StateFile As String)
+    On Error GoTo EH
+    If Not m_bSegActive Then Exit Sub
+    If LenB(StateFile) = 0 Then StateFile = m_sSegSavePath & ".czstate"
+    Dim lFh As Integer
+    lFh = FreeFile
+    Open StateFile For Binary Access Write As #lFh
+    '--- Magic + Version
+    Put #lFh, , STATE_MAGIC
+    Dim lVersion As Long: lVersion = 1
+    Put #lFh, , lVersion
+    '--- URL
+    Dim lLen As Long
+    lLen = Len(m_sSegUrl)
+    Put #lFh, , lLen
+    If lLen > 0 Then Put #lFh, , m_sSegUrl
+    '--- SavePath
+    lLen = Len(m_sSegSavePath)
+    Put #lFh, , lLen
+    If lLen > 0 Then Put #lFh, , m_sSegSavePath
+    '--- ExtraHeaders
+    lLen = Len(m_sSegExtraHeaders)
+    Put #lFh, , lLen
+    If lLen > 0 Then Put #lFh, , m_sSegExtraHeaders
+    '--- FileSize, TotalRecv, SegCount
+    Put #lFh, , m_lSegFileSize
+    Put #lFh, , m_lSegTotalRecv
+    Put #lFh, , m_lSegCount
+    '--- Per-segment state
+    Dim i As Long
+    For i = 0 To m_lSegCount - 1
+        Put #lFh, , m_lSegStartByte(i)
+        Put #lFh, , m_lSegEndByte(i)
+        Put #lFh, , m_lSegBytesRecv(i)
+        Put #lFh, , m_lSegStatus(i)
+    Next
+    '--- Timestamp
+    Dim dNow As Double: dNow = Now
+    Put #lFh, , dNow
+    Close #lFh
+    Exit Sub
+EH:
+    On Error Resume Next
+    Close #lFh
+    On Error GoTo 0
+End Sub
+
+Public Function LoadDownloadState(Optional StateFile As String) As Boolean
+    On Error GoTo EH
+    If LenB(StateFile) = 0 Then
+        '--- Can't determine state file without path, caller must provide
+        Exit Function
+    End If
+    If Dir$(StateFile) = vbNullString Then Exit Function
+    Dim lFh As Integer
+    lFh = FreeFile
+    Open StateFile For Binary Access Read As #lFh
+    '--- Read magic
+    Dim sMagic As String * 4
+    Get #lFh, , sMagic
+    If sMagic <> STATE_MAGIC Then
+        Close #lFh
+        Exit Function
+    End If
+    '--- Version
+    Dim lVersion As Long
+    Get #lFh, , lVersion
+    '--- URL
+    Dim lLen As Long
+    Get #lFh, , lLen
+    If lLen > 0 Then
+        m_sSegUrl = String$(lLen, 0)
+        Get #lFh, , m_sSegUrl
+    End If
+    '--- SavePath
+    Get #lFh, , lLen
+    If lLen > 0 Then
+        m_sSegSavePath = String$(lLen, 0)
+        Get #lFh, , m_sSegSavePath
+    End If
+    '--- ExtraHeaders
+    Get #lFh, , lLen
+    If lLen > 0 Then
+        m_sSegExtraHeaders = String$(lLen, 0)
+        Get #lFh, , m_sSegExtraHeaders
+    End If
+    '--- FileSize, TotalRecv, SegCount
+    Get #lFh, , m_lSegFileSize
+    Get #lFh, , m_lSegTotalRecv
+    Get #lFh, , m_lSegCount
+    '--- Per-segment
+    ReDim m_lSegStatus(0 To m_lSegCount - 1)
+    ReDim m_lSegStartByte(0 To m_lSegCount - 1)
+    ReDim m_lSegEndByte(0 To m_lSegCount - 1)
+    ReDim m_lSegBytesRecv(0 To m_lSegCount - 1)
+    ReDim m_lSegRetryCount(0 To m_lSegCount - 1)
+    ReDim m_hSegSocket(0 To m_lSegCount - 1)
+    ReDim m_hSegEvent(0 To m_lSegCount - 1)
+    ReDim m_hSegCred(0 To m_lSegCount * 2 - 1)
+    ReDim m_hSegCtx(0 To m_lSegCount * 2 - 1)
+    ReDim m_bSegHasCred(0 To m_lSegCount - 1)
+    ReDim m_bSegHasCtx(0 To m_lSegCount - 1)
+    ReDim m_uSegStreamSizes(0 To m_lSegCount - 1)
+    ReDim m_baSegTlsPending(0 To m_lSegCount - 1)
+    ReDim m_lSegTlsState(0 To m_lSegCount - 1)
+    ReDim m_bSegHeadersDone(0 To m_lSegCount - 1)
+    ReDim m_sSegRawHeader(0 To m_lSegCount - 1)
+    ReDim m_sSegRecvBuf(0 To m_lSegCount - 1)
+    Dim i As Long
+    For i = 0 To m_lSegCount - 1
+        Get #lFh, , m_lSegStartByte(i)
+        Get #lFh, , m_lSegEndByte(i)
+        Get #lFh, , m_lSegBytesRecv(i)
+        Get #lFh, , m_lSegStatus(i)
+        m_hSegSocket(i) = INVALID_SOCKET
+        m_lSegTlsState(i) = TLS_NONE
+    Next
+    Close #lFh
+    '--- Parse URL for host/port/path
+    Dim sScheme As String
+    pvParseUrl m_sSegUrl, sScheme, m_sSegHost, m_lSegPort, m_sSegPath
+    m_bSegUseTls = (LCase$(sScheme) = "https")
+    '--- Open the file
+    m_lSegFileHandle = FreeFile
+    Open m_sSegSavePath For Binary Access Read Write As #m_lSegFileHandle
+    '--- Resume: reconnect segments that were not done
+    m_bSegActive = True
+    m_lSegDoneCount = 0
+    m_lSegTotalRecv = 0
+    m_dSegStartTime = Timer
+    For i = 0 To m_lSegCount - 1
+        If m_lSegStatus(i) = SEG_DONE Then
+            m_lSegDoneCount = m_lSegDoneCount + 1
+            m_lSegTotalRecv = m_lSegTotalRecv + m_lSegBytesRecv(i)
+        Else
+            m_lSegTotalRecv = m_lSegTotalRecv + m_lSegBytesRecv(i)
+            m_lSegStatus(i) = SEG_IDLE
+            m_lSegRetryCount(i) = 0
+            pvSegCreateSocket i
+        End If
+    Next
+    '--- Start polling
+    tmrPoll.Enabled = True
+    LoadDownloadState = True
+    Exit Function
+EH:
+    On Error Resume Next
+    Close #lFh
+    On Error GoTo 0
+End Function
+
+Public Sub ClearDownloadState(Optional StateFile As String)
+    On Error Resume Next
+    If LenB(StateFile) = 0 Then
+        If LenB(m_sSegSavePath) <> 0 Then
+            StateFile = m_sSegSavePath & ".czstate"
+        Else
+            Exit Sub
+        End If
+    End If
+    If Dir$(StateFile) <> vbNullString Then
+        Kill StateFile
+    End If
+    On Error GoTo 0
 End Sub
 
 '=========================================================================
@@ -4229,6 +5492,7 @@ Private Sub UserControl_Initialize()
     m_baSendBuffer = vbNullString
     m_baTlsPending = vbNullString
     m_baWsBuffer = vbNullString
+    m_lDownloadSegments = 4
     '--- Initialize WinSock
     Dim baWSAData(0 To 399) As Byte
     If WSAStartup(&H202, baWSAData(0)) = 0 Then
@@ -4268,6 +5532,7 @@ Private Sub UserControl_InitProperties()
     m_sRemoteHost = DEF_REMOTEHOST
     m_lRemotePort = DEF_REMOTEPORT
     m_lTimeout = DEF_TIMEOUT
+    m_lDownloadSegments = 4
     Exit Sub
 EH:
     PrintError FUNC_NAME

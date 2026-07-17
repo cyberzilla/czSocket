@@ -1,8 +1,8 @@
 VERSION 5.00
 Begin VB.Form frmDownloader 
    BorderStyle     =   1  'Fixed Single
-   Caption         =   "czSocket Demo - Parallel Downloader && Uploader"
-   ClientHeight    =   10200
+   Caption         =   "czSocket v1.3 Demo - Segmented Downloader && Uploader"
+   ClientHeight    =   12000
    ClientLeft      =   120
    ClientTop       =   465
    ClientWidth     =   10200
@@ -17,7 +17,7 @@ Begin VB.Form frmDownloader
    EndProperty
    LinkTopic       =   "Form1"
    MaxButton       =   0   'False
-   ScaleHeight     =   9600
+   ScaleHeight     =   11400
    ScaleWidth      =   10170
    StartUpPosition =   2  'CenterScreen
    Begin czDownloader.czSocket czDl 
@@ -80,6 +80,23 @@ Begin VB.Form frmDownloader
          Top             =   1320
          Width           =   600
       End
+      Begin VB.TextBox txtSegments 
+         Alignment       =   2  'Center
+         Height          =   375
+         Left            =   3360
+         TabIndex        =   24
+         Text            =   "4"
+         Top             =   1320
+         Width           =   600
+      End
+      Begin VB.ComboBox cmbBandwidth 
+         Height          =   345
+         Left            =   5640
+         Style           =   2  'Dropdown List
+         TabIndex        =   25
+         Top             =   1320
+         Width           =   1440
+      End
       Begin VB.CommandButton btnClearDone 
          Caption         =   "Clear Completed"
          Height          =   375
@@ -87,6 +104,22 @@ Begin VB.Form frmDownloader
          TabIndex        =   6
          Top             =   1320
          Width           =   1620
+      End
+      Begin VB.Label lblSegments 
+         Caption         =   "Segments:"
+         Height          =   255
+         Left            =   2400
+         TabIndex        =   26
+         Top             =   1380
+         Width           =   900
+      End
+      Begin VB.Label lblBandwidth 
+         Caption         =   "Speed Limit:"
+         Height          =   255
+         Left            =   4560
+         TabIndex        =   27
+         Top             =   1380
+         Width           =   1095
       End
       Begin VB.Label lblUrl 
          Caption         =   "URL:"
@@ -167,12 +200,101 @@ Begin VB.Form frmDownloader
       Top             =   6420
       Width           =   7200
    End
+   Begin VB.Frame fraAdvanced 
+      Caption         =   " v1.3 Advanced Settings "
+      Height          =   1335
+      Left            =   120
+      TabIndex        =   28
+      Top             =   6840
+      Width           =   9960
+      Begin VB.TextBox txtProxyHost 
+         Height          =   315
+         Left            =   600
+         TabIndex        =   29
+         Top             =   300
+         Width           =   3600
+      End
+      Begin VB.TextBox txtProxyPort 
+         Alignment       =   2  'Center
+         Height          =   315
+         Left            =   4800
+         TabIndex        =   30
+         Text            =   "8080"
+         Top             =   300
+         Width           =   900
+      End
+      Begin VB.TextBox txtProxyUser 
+         Height          =   315
+         Left            =   6360
+         TabIndex        =   31
+         Top             =   300
+         Width           =   1620
+      End
+      Begin VB.TextBox txtProxyPass 
+         Height          =   315
+         IMEMode         =   3  'DISABLE
+         Left            =   8520
+         PasswordChar    =   "*"
+         TabIndex        =   32
+         Top             =   300
+         Width           =   1320
+      End
+      Begin VB.CheckBox chkAutoSave 
+         Caption         =   "Auto-save state (resume after crash)"
+         Height          =   315
+         Left            =   120
+         TabIndex        =   33
+         Top             =   780
+         Value           =   1  'Checked
+         Width           =   3600
+      End
+      Begin VB.CommandButton btnResumeState 
+         Caption         =   "Resume from State File..."
+         Height          =   375
+         Left            =   3840
+         TabIndex        =   34
+         Top             =   740
+         Width           =   2400
+      End
+      Begin VB.Label lblProxyHost 
+         Caption         =   "Proxy:"
+         Height          =   255
+         Left            =   120
+         TabIndex        =   35
+         Top             =   360
+         Width           =   495
+      End
+      Begin VB.Label lblProxyPort 
+         Caption         =   "Port:"
+         Height          =   255
+         Left            =   4320
+         TabIndex        =   36
+         Top             =   360
+         Width           =   495
+      End
+      Begin VB.Label lblProxyUser 
+         Caption         =   "User:"
+         Height          =   255
+         Left            =   5880
+         TabIndex        =   37
+         Top             =   360
+         Width           =   495
+      End
+      Begin VB.Label lblProxyPass 
+         Caption         =   "Pass:"
+         Height          =   255
+         Left            =   8100
+         TabIndex        =   38
+         Top             =   360
+         Width           =   495
+      End
+   End
    Begin VB.Frame fraUpload 
       Caption         =   " File Uploader "
       Height          =   1935
       Left            =   120
       TabIndex        =   16
-      Top             =   6840
+      Top             =   8280
       Width           =   9960
       Begin VB.TextBox txtUploadUrl 
          Height          =   375
@@ -248,7 +370,7 @@ Begin VB.Form frmDownloader
       MultiLine       =   -1  'True
       ScrollBars      =   2  'Vertical
       TabIndex        =   20
-      Top             =   8460
+      Top             =   10320
       Width           =   9960
    End
 End
@@ -260,11 +382,15 @@ Attribute VB_Exposed = False
 Option Explicit
 
 '=========================================================================
-' czSocket Demo - Parallel Downloader & Uploader
+' czSocket v1.3 Demo - Segmented Downloader & Uploader
 '
 ' Features:
 '   - Add multiple download URLs
 '   - Configurable max parallel downloads
+'   - IDM-style segmented download (per-file multi-connection)
+'   - Configurable bandwidth throttling
+'   - HTTP proxy support (CONNECT tunnel)
+'   - Download state persistence (resume after crash)
 '   - Visual progress bars drawn natively on PictureBox
 '   - Shows filename, percentage, speed, ETA per download
 '   - File upload to PHP endpoint
@@ -341,10 +467,20 @@ Private Sub Form_Load()
     m_lSelectedSlot = -1
     txtSaveFolder.Text = App.Path & "\Downloads"
     txtMaxParallel.Text = "4"
+    txtSegments.Text = "4"
     btnPause.Enabled = False
     btnStop.Enabled = False
-    Log "=== czSocket Parallel Downloader ==="
-    Log "Add URLs to download. Max parallel can be changed anytime."
+    '--- Bandwidth combo
+    cmbBandwidth.AddItem "Unlimited"
+    cmbBandwidth.AddItem "512 KB/s"
+    cmbBandwidth.AddItem "1 MB/s"
+    cmbBandwidth.AddItem "2 MB/s"
+    cmbBandwidth.AddItem "5 MB/s"
+    cmbBandwidth.AddItem "10 MB/s"
+    cmbBandwidth.ListIndex = 0
+    Log "=== czSocket v1.3 - Segmented Downloader ==="
+    Log "Features: Multi-segment, Proxy, Bandwidth limit, State persistence"
+    Log "Add URLs to download. Segments and speed limit apply per download."
     DrawProgress
 End Sub
 
@@ -822,6 +958,8 @@ Private Sub StartNextDownloads()
             m_tSlots(i).dStartTime = Timer
             m_lActiveCount = m_lActiveCount + 1
             On Error Resume Next
+            '--- Apply v1.3 settings
+            ApplyAdvancedSettings czDl(i)
             czDl(i).Download m_tSlots(i).sUrl, m_tSlots(i).sSavePath
             If Err.Number <> 0 Then
                 m_tSlots(i).lStatus = DL_ERROR
@@ -829,7 +967,13 @@ Private Sub StartNextDownloads()
                 m_lActiveCount = m_lActiveCount - 1
                 Log "! Start failed: " & m_tSlots(i).sFileName & " - " & Err.Description
             Else
-                Log "* Downloading: " & m_tSlots(i).sFileName
+                Dim sMode As String
+                If czDl(i).IsSegmented Then
+                    sMode = " [" & czDl(i).DownloadSegments & " segments]"
+                Else
+                    sMode = " [single]"
+                End If
+                Log "* Downloading: " & m_tSlots(i).sFileName & sMode
             End If
             On Error GoTo 0
         End If
@@ -1134,4 +1278,98 @@ Private Sub Form_Unload(Cancel As Integer)
         Unload czDl(i)
     Next i
     czDl(0).Disconnect
+End Sub
+
+'=========================================================================
+' v1.3 Settings Helpers
+'=========================================================================
+
+Private Sub ApplyAdvancedSettings(ctl As czSocket)
+    '--- Segments
+    Dim lSeg As Long
+    If IsNumeric(txtSegments.Text) Then
+        lSeg = CLng(txtSegments.Text)
+    Else
+        lSeg = 4
+    End If
+    ctl.DownloadSegments = lSeg
+    '--- Bandwidth limit
+    Select Case cmbBandwidth.ListIndex
+        Case 0: ctl.MaxBandwidth = 0           ' Unlimited
+        Case 1: ctl.MaxBandwidth = 524288      ' 512 KB/s
+        Case 2: ctl.MaxBandwidth = 1048576     ' 1 MB/s
+        Case 3: ctl.MaxBandwidth = 2097152     ' 2 MB/s
+        Case 4: ctl.MaxBandwidth = 5242880     ' 5 MB/s
+        Case 5: ctl.MaxBandwidth = 10485760    ' 10 MB/s
+        Case Else: ctl.MaxBandwidth = 0
+    End Select
+    '--- Proxy
+    If Len(Trim$(txtProxyHost.Text)) > 0 Then
+        ctl.ProxyHost = Trim$(txtProxyHost.Text)
+        If IsNumeric(txtProxyPort.Text) Then
+            ctl.ProxyPort = CLng(txtProxyPort.Text)
+        Else
+            ctl.ProxyPort = 8080
+        End If
+        ctl.ProxyUser = txtProxyUser.Text
+        ctl.ProxyPass = txtProxyPass.Text
+    Else
+        ctl.ProxyHost = vbNullString
+    End If
+    '--- State auto-save
+    If chkAutoSave.Value = 1 Then
+        ctl.StateAutoSaveInterval = 5
+    Else
+        ctl.StateAutoSaveInterval = 0
+    End If
+End Sub
+
+Private Sub btnResumeState_Click()
+    '--- Browse for .czstate file
+    Dim ofn As OPENFILENAME
+    Dim sFile As String
+    sFile = String$(260, vbNullChar)
+    ofn.lStructSize = Len(ofn)
+    ofn.hwndOwner = Me.hWnd
+    ofn.lpstrFilter = "czSocket State (*.czstate)" & vbNullChar & "*.czstate" & vbNullChar & _
+                      "All Files (*.*)" & vbNullChar & "*.*" & vbNullChar
+    ofn.lpstrFile = sFile
+    ofn.nMaxFile = 260
+    ofn.lpstrTitle = "Select state file to resume"
+    ofn.flags = &H1000 Or &H4  'OFN_FILEMUSTEXIST Or OFN_HIDEREADONLY
+    If GetOpenFileName(ofn) = 0 Then Exit Sub
+    sFile = Left$(ofn.lpstrFile, InStr(ofn.lpstrFile, vbNullChar) - 1)
+    '--- Use first available slot
+    If m_lCount >= MAX_SLOTS Then
+        MsgBox "Maximum download slots reached!", vbExclamation
+        Exit Sub
+    End If
+    Dim idx As Long
+    idx = m_lCount
+    m_lCount = m_lCount + 1
+    If idx > 0 Then Load czDl(idx)
+    '--- Apply settings and try to load state
+    ApplyAdvancedSettings czDl(idx)
+    If czDl(idx).LoadDownloadState(sFile) Then
+        '--- Derive filename from state file
+        Dim sStateName As String
+        sStateName = sFile
+        If Right$(LCase$(sStateName), 8) = ".czstate" Then
+            sStateName = Left$(sStateName, Len(sStateName) - 8)
+        End If
+        m_tSlots(idx).sFileName = ExtractFileName(sStateName)
+        m_tSlots(idx).sSavePath = sStateName
+        m_tSlots(idx).sUrl = "(resumed)"
+        m_tSlots(idx).lStatus = DL_ACTIVE
+        m_tSlots(idx).dStartTime = Timer
+        m_lActiveCount = m_lActiveCount + 1
+        Log "* Resumed from state: " & m_tSlots(idx).sFileName
+    Else
+        m_lCount = m_lCount - 1
+        If idx > 0 Then Unload czDl(idx)
+        MsgBox "Failed to load state file. File may be corrupted.", vbExclamation
+        Log "! Failed to load state: " & sFile
+    End If
+    DrawProgress
+    UpdateStatusLabel
 End Sub
