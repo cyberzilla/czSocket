@@ -10,7 +10,7 @@ Begin VB.UserControl czSocket
    ScaleWidth      =   480
    Begin VB.Timer tmrPoll 
       Enabled         =   0   'False
-      Interval        =   1
+      Interval        =   10
       Left            =   0
       Top             =   240
    End
@@ -821,6 +821,13 @@ Private m_sCertSubject          As String   '--- Cert subject filter
 
 '--- JSON Engine Cache ---
 Private m_oJsonRoot As Object
+
+'--- DNS resolution cache
+Private m_colDnsCache As Collection
+
+'--- HTTP redirect tracking
+Private m_lRedirectCount        As Long     '--- Current redirect hop count
+Private Const MAX_REDIRECTS     As Long = 10 '--- Max allowed redirects
 
 '--- Segmented download state
 Private m_lDownloadSegments     As Long     '--- Desired segment count (default 4)
@@ -1713,6 +1720,7 @@ Public Sub Download(Url As String, SavePath As String, Optional ExtraHeaders As 
     m_bDownloadMode = True
     m_lDownloadRecv = ResumeFrom
     m_lDownloadResumeFrom = ResumeFrom
+    m_lRedirectCount = 0  '--- Reset redirect counter for new download
     Exit Sub
 EH:
     m_bDownloadMode = False
@@ -2007,6 +2015,16 @@ Private Function pvResolveHost(sHost As String) As Long
     '--- Try as IP address first
     pvResolveHost = ws_inet_addr(sHost)
     If pvResolveHost <> INADDR_NONE Then Exit Function
+    '--- Check DNS cache (avoids blocking gethostbyname for repeated lookups)
+    If Not m_colDnsCache Is Nothing Then
+        On Error Resume Next
+        pvResolveHost = m_colDnsCache(sHost)
+        If Err.Number = 0 Then
+            On Error GoTo 0
+            Exit Function
+        End If
+        On Error GoTo 0
+    End If
     '--- DNS lookup (synchronous)
     Dim pHost As Long
     pHost = ws_gethostbyname(sHost)
@@ -2028,6 +2046,11 @@ Private Function pvResolveHost(sHost As String) As Long
         Exit Function
     End If
     CopyMemory pvResolveHost, ByVal lFirstAddr, 4
+    '--- Cache the resolved address for future lookups
+    If m_colDnsCache Is Nothing Then Set m_colDnsCache = New Collection
+    On Error Resume Next
+    m_colDnsCache.Add pvResolveHost, sHost
+    On Error GoTo 0
 End Function
 
 Private Sub pvFlushSendBuffer()
@@ -2935,6 +2958,14 @@ Private Sub pvOnClose()
             End If
         Loop While lRecv > 0
     End If
+    '--- Handle active streaming download interrupted by connection close
+    If m_bDownloadMode And m_lDownloadFh <> 0 Then
+        Close #m_lDownloadFh
+        m_lDownloadFh = 0
+        m_bDownloadMode = False
+        m_lDownloadRecv = 0
+        m_lDownloadResumeFrom = 0
+    End If
     '--- HTTP: if waiting for response with no Content-Length, deliver what we have
     If m_lHttpState = HTTP_WAITING And LenB(m_sHttpRawResponse) <> 0 Then
         Dim lHdrEnd As Long
@@ -3256,11 +3287,62 @@ Private Sub pvHttpProcessResponse()
         End If
         '--- Check for chunked transfer encoding
         m_bHttpChunked = (InStr(1, pvHttpGetHeader(sHeaders, "Transfer-Encoding"), "chunked", vbTextCompare) > 0)
+        '--- For download mode with known Content-Length, force non-chunked streaming
+        '--- When CL is known, we can stream directly to file regardless of Transfer-Encoding
+        '--- This avoids string accumulation (memory bloat) and ensures accurate progress tracking
+        If m_bDownloadMode And m_bHttpChunked And m_lHttpContentLength > 0 Then
+            m_bHttpChunked = False
+        End If
         '--- HEAD response: fire immediately (no body expected for HEAD)
         If m_bSegHeadPhase Then
             m_lHttpState = HTTP_NONE
             pvFireResponse m_lHttpStatus, m_sHttpContentType, vbNullString, m_sHttpHeaders
             Exit Sub
+        End If
+        '--- Reset transfer timer to when actual data transfer starts (exclude DNS/connect/TLS time)
+        m_dTransferStart = Timer
+        '--- Handle HTTP redirects (301, 302, 303, 307, 308)
+        If (m_lHttpStatus = 301 Or m_lHttpStatus = 302 Or m_lHttpStatus = 303 Or _
+            m_lHttpStatus = 307 Or m_lHttpStatus = 308) Then
+            Dim sLocation As String
+            sLocation = pvHttpGetHeader(sHeaders, "Location")
+            If LenB(sLocation) <> 0 And m_lRedirectCount < MAX_REDIRECTS Then
+                m_lRedirectCount = m_lRedirectCount + 1
+                '--- Resolve relative URLs
+                If Left$(sLocation, 4) <> "http" Then
+                    Dim sBaseScheme As String
+                    If m_eProtocol = sckTLSProtocol Then sBaseScheme = "https" Else sBaseScheme = "http"
+                    If Left$(sLocation, 2) = "//" Then
+                        '--- Protocol-relative: //host/path
+                        sLocation = sBaseScheme & ":" & sLocation
+                    ElseIf Left$(sLocation, 1) = "/" Then
+                        '--- Path-relative: /path
+                        sLocation = sBaseScheme & "://" & m_sRemoteHost & sLocation
+                    End If
+                End If
+                '--- Clean up current connection state
+                m_lHttpStatus = 0
+                m_lHttpState = HTTP_NONE
+                m_sHttpBody = vbNullString
+                m_sHttpRawResponse = vbNullString
+                '--- Re-issue download to redirect target
+                If m_bDownloadMode Then
+                    Dim sRedirSavePath As String
+                    sRedirSavePath = m_sDownloadPath
+                    Dim lRedirResume As Long
+                    lRedirResume = m_lDownloadResumeFrom
+                    Dim lRedirCount As Long
+                    lRedirCount = m_lRedirectCount
+                    m_bDownloadMode = False
+                    Download sLocation, sRedirSavePath, , lRedirResume
+                    m_lRedirectCount = lRedirCount  '--- Preserve redirect counter
+                Else
+                    Request "GET", sLocation
+                End If
+                '--- Ensure timer stays alive for async connect (Disconnect kills it)
+                tmrPoll.Enabled = True
+                Exit Sub
+            End If
         End If
         '--- For 206 Partial Content (resume), Content-Length is remaining bytes
         '--- Adjust total to include already-downloaded portion
@@ -3411,6 +3493,42 @@ Private Function pvHttpDecodeChunked(sData As String, sResult As String) As Bool
         sResult = sResult & Left$(sWork, lChunkSize)
         sWork = Mid$(sWork, lChunkSize + 3)  '--- skip chunk data + CrLf
     Loop
+End Function
+
+Private Function pvHttpDecodeChunkedToFile() As Boolean
+    '--- Decode chunked transfer encoding and write data directly to download file
+    '--- Returns True when final 0-length chunk is received (download complete)
+    Dim sWork As String
+    sWork = m_sHttpBody
+    Do
+        Dim lCrLf As Long
+        lCrLf = InStr(sWork, vbCrLf)
+        If lCrLf = 0 Then Exit Do  '--- Incomplete chunk header, need more data
+        Dim lChunkLen As Long
+        On Error Resume Next
+        lChunkLen = CLng("&H" & Trim$(Left$(sWork, lCrLf - 1)))
+        If Err.Number <> 0 Then
+            On Error GoTo 0
+            Exit Do  '--- Invalid chunk header
+        End If
+        On Error GoTo 0
+        If lChunkLen = 0 Then
+            '--- Final chunk received, download is complete
+            m_sHttpBody = vbNullString
+            pvHttpDecodeChunkedToFile = True
+            Exit Function
+        End If
+        Dim sAfterHdr As String
+        sAfterHdr = Mid$(sWork, lCrLf + 2)
+        If Len(sAfterHdr) < lChunkLen + 2 Then Exit Do  '--- Incomplete chunk data
+        '--- Write decoded chunk data to download file
+        Dim baChunk() As Byte
+        baChunk = pvToAcpArray(Left$(sAfterHdr, lChunkLen))
+        Put #m_lDownloadFh, , baChunk
+        m_lDownloadRecv = m_lDownloadRecv + pvArraySize(baChunk)
+        sWork = Mid$(sAfterHdr, lChunkLen + 3)  '--- Skip chunk data + trailing CrLf
+    Loop
+    m_sHttpBody = sWork  '--- Save remaining partial data for next call
 End Function
 
 '=========================================================================
@@ -3994,20 +4112,25 @@ Private Sub pvPollSegments()
             End If
             '--- FD_CLOSE
             If (uNE.lNetworkEvents And FD_CLOSE) <> 0 Then
-                '--- Check if we got all expected data
-                Dim lExpected As Long
-                lExpected = m_lSegEndByte(i) - m_lSegStartByte(i) + 1
-                If m_lSegBytesRecv(i) >= lExpected Then
-                    m_lSegStatus(i) = SEG_DONE
-                    m_lSegDoneCount = m_lSegDoneCount + 1
-                Else
-                    '--- Try to read remaining data first
-                    pvSegOnReceive i
+                '--- Skip if already completed (prevent double-count from FD_READ)
+                If m_lSegStatus(i) <> SEG_DONE Then
+                    '--- Check if we got all expected data
+                    Dim lExpected As Long
+                    lExpected = m_lSegEndByte(i) - m_lSegStartByte(i) + 1
                     If m_lSegBytesRecv(i) >= lExpected Then
                         m_lSegStatus(i) = SEG_DONE
                         m_lSegDoneCount = m_lSegDoneCount + 1
                     Else
-                        m_lSegStatus(i) = SEG_ERROR
+                        '--- Try to read remaining data first
+                        pvSegOnReceive i
+                        If m_lSegBytesRecv(i) >= lExpected Then
+                            If m_lSegStatus(i) <> SEG_DONE Then
+                                m_lSegStatus(i) = SEG_DONE
+                                m_lSegDoneCount = m_lSegDoneCount + 1
+                            End If
+                        Else
+                            m_lSegStatus(i) = SEG_ERROR
+                        End If
                     End If
                 End If
             End If
@@ -4095,8 +4218,10 @@ Private Sub pvSegOnReceive(ByVal lIdx As Long)
         Dim lExpected As Long
         lExpected = m_lSegEndByte(lIdx) - m_lSegStartByte(lIdx) + 1
         If m_lSegBytesRecv(lIdx) >= lExpected Then
-            m_lSegStatus(lIdx) = SEG_DONE
-            m_lSegDoneCount = m_lSegDoneCount + 1
+            If m_lSegStatus(lIdx) <> SEG_DONE Then
+                m_lSegStatus(lIdx) = SEG_DONE
+                m_lSegDoneCount = m_lSegDoneCount + 1
+            End If
             Exit Do
         End If
     Loop

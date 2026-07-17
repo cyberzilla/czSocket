@@ -1184,9 +1184,12 @@ Private Function ExtractFileName(sUrl As String) As String
     s = sUrl
     lQ = InStr(s, "?")
     If lQ > 0 Then s = Left$(s, lQ - 1)
-    '--- Get last path segment
+    '--- Get last path segment (handle both / and \)
     Dim lSlash As Long
     lSlash = InStrRev(s, "/")
+    Dim lBack As Long
+    lBack = InStrRev(s, "\")
+    If lBack > lSlash Then lSlash = lBack
     If lSlash > 0 And lSlash < Len(s) Then
         ExtractFileName = Mid$(s, lSlash + 1)
     Else
