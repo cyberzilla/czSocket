@@ -824,6 +824,7 @@ Private m_oJsonRoot As Object
 
 '--- DNS resolution cache
 Private m_colDnsCache As Collection
+Private m_dDnsCacheCreated As Double   '--- Timestamp when DNS cache was created
 
 '--- HTTP redirect tracking
 Private m_lRedirectCount        As Long     '--- Current redirect hop count
@@ -1372,17 +1373,19 @@ End Sub
 Public Sub Accept(ByVal requestID As Long)
     On Error GoTo EH
     Disconnect
-    '--- Check global request socket first
+    '--- Check global request socket first (keyed by socket handle to prevent race conditions)
+    Dim sPropKey As String
+    sPropKey = "czS_" & Hex$(requestID)
     Dim hGlobalSocket As Long
-    hGlobalSocket = GetPropA(GetDesktopWindow(), PROP_REQUEST_SOCKET)
+    hGlobalSocket = GetPropA(GetDesktopWindow(), sPropKey & "_S")
     If hGlobalSocket <> 0 And hGlobalSocket = requestID Then
         '--- Take ownership of the accepted socket
         m_hSocket = hGlobalSocket
-        m_eProtocol = GetPropA(GetDesktopWindow(), PROP_REQUEST_PROTOCOL)
+        m_eProtocol = GetPropA(GetDesktopWindow(), sPropKey & "_P")
         '--- Retrieve TLS server info from listener
-        m_lCertContext = GetPropA(GetDesktopWindow(), "czSocket_CertContext")
-        m_lCertStore = GetPropA(GetDesktopWindow(), "czSocket_CertStore")
-        m_bTlsServer = (GetPropA(GetDesktopWindow(), "czSocket_TlsServer") <> 0)
+        m_lCertContext = GetPropA(GetDesktopWindow(), sPropKey & "_CC")
+        m_lCertStore = GetPropA(GetDesktopWindow(), sPropKey & "_CS")
+        m_bTlsServer = (GetPropA(GetDesktopWindow(), sPropKey & "_TS") <> 0)
     Else
         '--- Use requestID directly as socket handle
         m_hSocket = requestID
@@ -1587,8 +1590,10 @@ Public Sub Request(Method As String, Url As String, Optional Body As String, Opt
     sReq = Method & " " & sPath & " HTTP/1.1" & vbCrLf & _
            "Host: " & sHost & vbCrLf
     If LenB(Body) <> 0 Then
+        Dim baBodyCheck() As Byte
+        baBodyCheck = pvToAcpArray(Body)
         sReq = sReq & "Content-Type: " & ContentType & vbCrLf & _
-               "Content-Length: " & Len(Body) & vbCrLf
+               "Content-Length: " & pvArraySize(baBodyCheck) & vbCrLf
     End If
     If LenB(ExtraHeaders) <> 0 Then
         sReq = sReq & ExtraHeaders & vbCrLf
@@ -1621,9 +1626,11 @@ Public Sub Upload(Url As String, FilePath As String, _
     Optional ExtraHeaders As String)
     On Error GoTo EH
     '--- Get file size (without loading into memory)
+    If Dir$(FilePath) = "" Then Err.Raise vbObjectError, , "File not found: " & FilePath
     Dim lFileSize As Long
     lFileSize = FileLen(FilePath)
-    If lFileSize = 0 Then Err.Raise vbObjectError, , "File is empty or not found: " & FilePath
+    If lFileSize = 0 Then Err.Raise vbObjectError, , "File is empty: " & FilePath
+    If lFileSize < 0 Then Err.Raise vbObjectError, , "File exceeds 2GB limit (Long overflow): " & FilePath
     '--- Extract filename
     Dim sFileName As String
     Dim lSlash As Long
@@ -1947,7 +1954,9 @@ Private Sub pvWsClose(Optional ByVal Code As Long = 1000, Optional Reason As Str
     Dim baReason() As Byte
     baReason = vbNullString
     If LenB(Reason) <> 0 Then baReason = pvToUtf8Array(Reason)
-    ReDim baPayload(0 To 1 + pvArraySize(baReason))
+    Dim lReasonSize As Long
+    lReasonSize = pvArraySize(baReason)
+    ReDim baPayload(0 To 1 + lReasonSize - IIf(lReasonSize > 0, 0, 1))
     baPayload(0) = CByte((Code \ 256) And &HFF)
     baPayload(1) = CByte(Code And &HFF)
     If pvArraySize(baReason) > 0 Then
@@ -2017,13 +2026,21 @@ Private Function pvResolveHost(sHost As String) As Long
     If pvResolveHost <> INADDR_NONE Then Exit Function
     '--- Check DNS cache (avoids blocking gethostbyname for repeated lookups)
     If Not m_colDnsCache Is Nothing Then
-        On Error Resume Next
-        pvResolveHost = m_colDnsCache(sHost)
-        If Err.Number = 0 Then
+        '--- Expire entire cache after 5 minutes (handles DNS changes, failover)
+        Dim dCacheAge As Double
+        dCacheAge = Timer - m_dDnsCacheCreated
+        If dCacheAge < 0 Then dCacheAge = dCacheAge + 86400#
+        If dCacheAge > 300# Then
+            Set m_colDnsCache = Nothing
+        Else
+            On Error Resume Next
+            pvResolveHost = m_colDnsCache(sHost)
+            If Err.Number = 0 Then
+                On Error GoTo 0
+                Exit Function
+            End If
             On Error GoTo 0
-            Exit Function
         End If
-        On Error GoTo 0
     End If
     '--- DNS lookup (synchronous)
     Dim pHost As Long
@@ -2047,7 +2064,10 @@ Private Function pvResolveHost(sHost As String) As Long
     End If
     CopyMemory pvResolveHost, ByVal lFirstAddr, 4
     '--- Cache the resolved address for future lookups
-    If m_colDnsCache Is Nothing Then Set m_colDnsCache = New Collection
+    If m_colDnsCache Is Nothing Then
+        Set m_colDnsCache = New Collection
+        m_dDnsCacheCreated = Timer
+    End If
     On Error Resume Next
     m_colDnsCache.Add pvResolveHost, sHost
     On Error GoTo 0
@@ -2680,7 +2700,10 @@ Private Sub pvRawSend(baData() As Byte)
                 dStart = Timer
                 Do
                     DoEvents
-                    If Timer - dStart > CDbl(m_lTimeout) / 1000# Then Exit Sub
+                    Dim dElap As Double
+                    dElap = Timer - dStart
+                    If dElap < 0 Then dElap = dElap + 86400#
+                    If dElap > CDbl(m_lTimeout) / 1000# Then Exit Sub
                     lSent = ws_send(m_hSocket, baData(lPos), lSize - lPos, 0)
                     If lSent <> SOCKET_ERROR Then Exit Do
                     If WSAGetLastError() <> WSAEWOULDBLOCK Then Exit Sub
@@ -2802,7 +2825,10 @@ Private Sub pvOnReceive()
         Dim lMaxRecv As Long
         lMaxRecv = RECV_BUFFER_SIZE
         If m_lMaxBandwidth > 0 Then
-            If Timer - m_dBwLastReset >= 1# Then
+            Dim dBwElap As Double
+            dBwElap = Timer - m_dBwLastReset
+            If dBwElap < 0 Then dBwElap = dBwElap + 86400#
+            If dBwElap >= 1# Then
                 m_lBwBytesThisSec = 0
                 m_dBwLastReset = Timer
             End If
@@ -2911,26 +2937,28 @@ Private Sub pvOnAccept()
     Dim hNewSocket As Long
     hNewSocket = ws_accept(m_hSocket, uAddr, lLen)
     If hNewSocket = INVALID_SOCKET Then Exit Sub
-    '--- Store globally for Accept pattern
-    SetPropA GetDesktopWindow(), PROP_REQUEST_SOCKET, hNewSocket
-    SetPropA GetDesktopWindow(), PROP_REQUEST_PROTOCOL, CLng(m_eProtocol)
+    '--- Store globally for Accept pattern (keyed by socket handle to prevent race conditions)
+    Dim sPropKey As String
+    sPropKey = "czS_" & Hex$(hNewSocket)
+    SetPropA GetDesktopWindow(), sPropKey & "_S", hNewSocket
+    SetPropA GetDesktopWindow(), sPropKey & "_P", CLng(m_eProtocol)
     '--- Propagate TLS server cert info
     If m_bTlsServer Then
-        SetPropA GetDesktopWindow(), "czSocket_CertContext", m_lCertContext
-        SetPropA GetDesktopWindow(), "czSocket_CertStore", m_lCertStore
-        SetPropA GetDesktopWindow(), "czSocket_TlsServer", 1
+        SetPropA GetDesktopWindow(), sPropKey & "_CC", m_lCertContext
+        SetPropA GetDesktopWindow(), sPropKey & "_CS", m_lCertStore
+        SetPropA GetDesktopWindow(), sPropKey & "_TS", 1
     Else
-        SetPropA GetDesktopWindow(), "czSocket_TlsServer", 0
+        SetPropA GetDesktopWindow(), sPropKey & "_TS", 0
     End If
     '--- Raise event
     pvState = sckConnectionPending
     RaiseEvent ConnectionRequest(hNewSocket)
     '--- Clear global
-    RemovePropA GetDesktopWindow(), PROP_REQUEST_SOCKET
-    RemovePropA GetDesktopWindow(), PROP_REQUEST_PROTOCOL
-    RemovePropA GetDesktopWindow(), "czSocket_CertContext"
-    RemovePropA GetDesktopWindow(), "czSocket_CertStore"
-    RemovePropA GetDesktopWindow(), "czSocket_TlsServer"
+    RemovePropA GetDesktopWindow(), sPropKey & "_S"
+    RemovePropA GetDesktopWindow(), sPropKey & "_P"
+    RemovePropA GetDesktopWindow(), sPropKey & "_CC"
+    RemovePropA GetDesktopWindow(), sPropKey & "_CS"
+    RemovePropA GetDesktopWindow(), sPropKey & "_TS"
     pvState = sckListening
     Exit Sub
 EH:
@@ -3240,14 +3268,33 @@ Private Sub pvHttpProcessResponse()
     On Error GoTo EH
     '--- If headers already parsed AND streaming download, write bytes directly (skip string conversion)
     If m_lHttpStatus <> 0 And m_bDownloadMode And m_lDownloadFh <> 0 Then
-        Dim lSize As Long
-        lSize = pvArraySize(m_baRecvBuffer)
-        If lSize > 0 Then
-            Put #m_lDownloadFh, , m_baRecvBuffer
-            m_lDownloadRecv = m_lDownloadRecv + lSize
+        If m_bHttpChunked Then
+            '--- Chunked download: accumulate body, decode chunks to file incrementally
+            m_sHttpBody = m_sHttpBody & pvFromAcpArray(m_baRecvBuffer)
+            m_baRecvBuffer = vbNullString
+            If pvHttpDecodeChunkedToFile() Then
+                '--- All chunks received, download complete
+                Close #m_lDownloadFh
+                m_lDownloadFh = 0
+                m_lHttpState = HTTP_NONE
+                m_bDownloadMode = False
+                pvFireProgress m_lDownloadRecv, m_lDownloadRecv
+                RaiseEvent Response(m_lHttpStatus, m_sHttpContentType, m_sDownloadPath, m_sHttpHeaders)
+                m_sDownloadPath = vbNullString
+                Exit Sub
+            End If
+            GoTo FireProgress
+        Else
+            '--- Non-chunked: write raw bytes directly to file
+            Dim lSize As Long
+            lSize = pvArraySize(m_baRecvBuffer)
+            If lSize > 0 Then
+                Put #m_lDownloadFh, , m_baRecvBuffer
+                m_lDownloadRecv = m_lDownloadRecv + lSize
+            End If
+            m_baRecvBuffer = vbNullString
+            GoTo FireProgress
         End If
-        m_baRecvBuffer = vbNullString
-        GoTo FireProgress
     End If
     '--- Convert to string for header parsing / normal response
     Dim sChunk As String
@@ -3350,24 +3397,39 @@ Private Sub pvHttpProcessResponse()
             m_lHttpContentLength = m_lHttpContentLength + m_lDownloadResumeFrom
         End If
         '--- Streaming download: open file and write initial body data
-        If m_bDownloadMode And LenB(m_sDownloadPath) <> 0 And Not m_bHttpChunked Then
+        If m_bDownloadMode And LenB(m_sDownloadPath) <> 0 Then
             m_lDownloadFh = FreeFile
             Open m_sDownloadPath For Binary Access Read Write As #m_lDownloadFh
-            If m_lDownloadResumeFrom > 0 Then
-                '--- Resume: seek to resume position (append)
+            If m_lDownloadResumeFrom > 0 And Not m_bHttpChunked Then
+                '--- Resume: seek to resume position (append) - only for non-chunked
                 Seek #m_lDownloadFh, m_lDownloadResumeFrom + 1  '1-based in VB6
                 m_lDownloadRecv = m_lDownloadResumeFrom
             Else
-                '--- New download: start from beginning
                 m_lDownloadRecv = 0
             End If
-            If LenB(m_sHttpBody) <> 0 Then
-                Dim baInit() As Byte
-                baInit = pvToAcpArray(m_sHttpBody)
-                Put #m_lDownloadFh, , baInit
-                m_lDownloadRecv = m_lDownloadRecv + pvArraySize(baInit)
+            If m_bHttpChunked Then
+                '--- Chunked download: try to decode initial body data
+                If LenB(m_sHttpBody) <> 0 Then
+                    If pvHttpDecodeChunkedToFile() Then
+                        Close #m_lDownloadFh
+                        m_lDownloadFh = 0
+                        m_lHttpState = HTTP_NONE
+                        m_bDownloadMode = False
+                        RaiseEvent Response(m_lHttpStatus, m_sHttpContentType, m_sDownloadPath, m_sHttpHeaders)
+                        m_sDownloadPath = vbNullString
+                        Exit Sub
+                    End If
+                End If
+            Else
+                '--- Non-chunked: write initial body bytes
+                If LenB(m_sHttpBody) <> 0 Then
+                    Dim baInit() As Byte
+                    baInit = pvToAcpArray(m_sHttpBody)
+                    Put #m_lDownloadFh, , baInit
+                    m_lDownloadRecv = m_lDownloadRecv + pvArraySize(baInit)
+                End If
+                m_sHttpBody = vbNullString
             End If
-            m_sHttpBody = vbNullString
         End If
     Else
         '--- Headers already parsed, normal (non-download) mode: accumulate body
@@ -3463,15 +3525,17 @@ End Sub
 
 Private Function pvHttpGetHeader(sHeaders As String, sName As String) As String
     Dim lPos As Long
-    lPos = InStr(1, sHeaders, vbCrLf & sName & ": ", vbTextCompare)
-    If lPos = 0 Then lPos = InStr(1, sHeaders, vbCrLf & sName & ":", vbTextCompare)
+    Dim sSearch As String
+    '--- Search for exact header name (case-insensitive)
+    sSearch = vbCrLf & sName & ":"
+    lPos = InStr(1, sHeaders, sSearch, vbTextCompare)
     If lPos = 0 Then Exit Function
-    lPos = InStr(lPos + 2, sHeaders, ":")
-    If lPos = 0 Then Exit Function
+    '--- Skip past "\r\nHeaderName:" to get the value
+    lPos = lPos + Len(sSearch)
     Dim lEnd As Long
     lEnd = InStr(lPos, sHeaders, vbCrLf)
     If lEnd = 0 Then lEnd = Len(sHeaders) + 1
-    pvHttpGetHeader = Trim$(Mid$(sHeaders, lPos + 1, lEnd - lPos - 1))
+    pvHttpGetHeader = Trim$(Mid$(sHeaders, lPos, lEnd - lPos))
 End Function
 
 Private Function pvHttpDecodeChunked(sData As String, sResult As String) As Boolean
@@ -3483,7 +3547,13 @@ Private Function pvHttpDecodeChunked(sData As String, sResult As String) As Bool
         lCrLf = InStr(sWork, vbCrLf)
         If lCrLf = 0 Then Exit Function  '--- incomplete
         Dim lChunkSize As Long
-        lChunkSize = CLng("&H" & Left$(sWork, lCrLf - 1))
+        On Error Resume Next
+        lChunkSize = CLng("&H" & Trim$(Left$(sWork, lCrLf - 1)))
+        If Err.Number <> 0 Then
+            On Error GoTo 0
+            Exit Function  '--- Invalid chunk header
+        End If
+        On Error GoTo 0
         If lChunkSize = 0 Then
             pvHttpDecodeChunked = True
             Exit Function
@@ -3878,7 +3948,16 @@ Private Sub pvSegOnHeadResponse(ByVal lStatus As Long, sHeaders As String)
     Dim sCL As String
     sCL = pvHttpGetHeader(sHeaders, "Content-Length")
     Dim lFileSize As Long
-    If LenB(sCL) <> 0 Then lFileSize = CLng(sCL)
+    If LenB(sCL) <> 0 Then
+        On Error Resume Next
+        lFileSize = CLng(sCL)
+        If Err.Number <> 0 Then
+            '--- Content-Length exceeds Long range (>2GB): fallback to single download
+            On Error GoTo EH
+            GoTo FallbackSingle
+        End If
+        On Error GoTo EH
+    End If
     '--- If server supports Range and file size is known, use segmented download
     If InStr(1, sAcceptRanges, "bytes", vbTextCompare) > 0 And lFileSize > 0 Then
         m_lSegFileSize = lFileSize
@@ -4064,7 +4143,10 @@ Private Sub pvSegRawSend(ByVal lIdx As Long, baData() As Byte)
                 dStart = Timer
                 Do
                     DoEvents
-                    If Timer - dStart > 5# Then Exit Sub
+                    Dim dSegElap As Double
+                    dSegElap = Timer - dStart
+                    If dSegElap < 0 Then dSegElap = dSegElap + 86400#
+                    If dSegElap > 5# Then Exit Sub
                     lSent = ws_send(m_hSegSocket(lIdx), baData(lPos), lSize - lPos, 0)
                     If lSent <> SOCKET_ERROR Then Exit Do
                     If WSAGetLastError() <> WSAEWOULDBLOCK Then Exit Sub
@@ -4163,12 +4245,15 @@ Private Sub pvSegOnReceive(ByVal lIdx As Long)
         Dim lMaxRecv As Long
         lMaxRecv = RECV_BUFFER_SIZE
         If m_lMaxBandwidth > 0 Then
-            If Timer - m_dBwLastReset >= 1# Then
+            Dim dBwElap2 As Double
+            dBwElap2 = Timer - m_dBwLastReset
+            If dBwElap2 < 0 Then dBwElap2 = dBwElap2 + 86400#
+            If dBwElap2 >= 1# Then
                 m_lBwBytesThisSec = 0
                 m_dBwLastReset = Timer
             End If
             Dim lBudget As Long
-            lBudget = (m_lMaxBandwidth \ m_lSegCount) - m_lBwBytesThisSec
+            lBudget = m_lMaxBandwidth - m_lBwBytesThisSec
             If lBudget <= 0 Then Exit Do
             If lBudget < lMaxRecv Then lMaxRecv = lBudget
         End If
@@ -4179,40 +4264,48 @@ Private Sub pvSegOnReceive(ByVal lIdx As Long)
         ReDim Preserve baBuffer(0 To lRecv - 1)
         If m_lMaxBandwidth > 0 Then m_lBwBytesThisSec = m_lBwBytesThisSec + lRecv
         '--- Process TLS if active
+        Dim baDecrypted() As Byte
         If m_bSegUseTls And m_lSegTlsState(lIdx) = TLS_HANDSHAKE Then
             pvSegTlsHandshakeStep lIdx, baBuffer
             Exit Do
         ElseIf m_bSegUseTls And m_lSegTlsState(lIdx) = TLS_CONNECTED Then
-            '--- Decrypt TLS data
-            Dim sDecrypted As String
-            sDecrypted = pvSegTlsDecrypt(lIdx, baBuffer)
-            If LenB(sDecrypted) = 0 Then Exit Do
-            m_sSegRecvBuf(lIdx) = m_sSegRecvBuf(lIdx) & sDecrypted
+            '--- Decrypt TLS data to raw bytes (avoids lossy String conversion)
+            baDecrypted = pvSegTlsDecryptBytes(lIdx, baBuffer)
+            If pvArraySize(baDecrypted) = 0 Then Exit Do
         Else
-            '--- Plain TCP
-            m_sSegRecvBuf(lIdx) = m_sSegRecvBuf(lIdx) & pvFromAcpArray(baBuffer)
+            '--- Plain TCP: use raw bytes directly
+            baDecrypted = baBuffer
         End If
         '--- Parse HTTP headers if not done yet
         If Not m_bSegHeadersDone(lIdx) Then
+            '--- Accumulate header text (headers are ASCII, string conversion is safe)
+            Dim lPrevHdrLen As Long
+            lPrevHdrLen = Len(m_sSegRawHeader(lIdx))
+            m_sSegRawHeader(lIdx) = m_sSegRawHeader(lIdx) & pvFromAcpArray(baDecrypted)
             Dim lHdrEnd As Long
-            lHdrEnd = InStr(m_sSegRecvBuf(lIdx), vbCrLf & vbCrLf)
+            lHdrEnd = InStr(m_sSegRawHeader(lIdx), vbCrLf & vbCrLf)
             If lHdrEnd > 0 Then
                 m_bSegHeadersDone(lIdx) = True
-                '--- Extract body after headers
-                Dim sBody As String
-                sBody = Mid$(m_sSegRecvBuf(lIdx), lHdrEnd + 4)
-                m_sSegRecvBuf(lIdx) = vbNullString
-                '--- Write body data to file
-                If LenB(sBody) > 0 Then
-                    pvSegWriteData lIdx, sBody
+                m_sSegRawHeader(lIdx) = vbNullString
+                '--- Extract body bytes from current baDecrypted (avoids lossy round-trip)
+                '--- Header byte length = lHdrEnd + 3 (0-based offset of body start)
+                '--- Body starts within baDecrypted at offset (lHdrEnd + 3) - lPrevHdrLen
+                Dim lBodyOff As Long
+                lBodyOff = (lHdrEnd + 3) - lPrevHdrLen
+                If lBodyOff >= 0 And lBodyOff < pvArraySize(baDecrypted) Then
+                    Dim lBodyLen As Long
+                    lBodyLen = pvArraySize(baDecrypted) - lBodyOff
+                    If lBodyLen > 0 Then
+                        Dim baBody() As Byte
+                        ReDim baBody(0 To lBodyLen - 1)
+                        CopyMemory baBody(0), baDecrypted(lBodyOff), lBodyLen
+                        pvSegWriteData lIdx, baBody
+                    End If
                 End If
             End If
         Else
-            '--- Headers already done, all recv data is body
-            If LenB(m_sSegRecvBuf(lIdx)) > 0 Then
-                pvSegWriteData lIdx, m_sSegRecvBuf(lIdx)
-                m_sSegRecvBuf(lIdx) = vbNullString
-            End If
+            '--- Headers already done, write raw bytes directly to file
+            pvSegWriteData lIdx, baDecrypted
         End If
         '--- Check if segment is complete
         Dim lExpected As Long
@@ -4230,10 +4323,8 @@ EH:
     PrintError FUNC_NAME
 End Sub
 
-Private Sub pvSegWriteData(ByVal lIdx As Long, sData As String)
+Private Sub pvSegWriteData(ByVal lIdx As Long, baData() As Byte)
     On Error GoTo EH
-    Dim baData() As Byte
-    baData = pvToAcpArray(sData)
     Dim lSize As Long
     lSize = pvArraySize(baData)
     If lSize = 0 Then Exit Sub
@@ -4526,7 +4617,7 @@ EH:
     baOut = vbNullString
 End Sub
 
-Private Function pvSegTlsDecrypt(ByVal lIdx As Long, baInput() As Byte) As String
+Private Function pvSegTlsDecryptBytes(ByVal lIdx As Long, baInput() As Byte) As Byte()
     On Error GoTo EH
     '--- Append to pending
     Dim baPending() As Byte
@@ -4536,8 +4627,8 @@ Private Function pvSegTlsDecrypt(ByVal lIdx As Long, baInput() As Byte) As Strin
     Else
         baPending = baInput
     End If
-    Dim sResult As String
-    sResult = vbNullString
+    Dim baResult() As Byte
+    baResult = vbNullString
     Do
         Dim lPendSize As Long
         lPendSize = pvArraySize(baPending)
@@ -4556,14 +4647,14 @@ Private Function pvSegTlsDecrypt(ByVal lIdx As Long, baInput() As Byte) As Strin
         Dim lResult As Long
         lResult = DecryptMessage(m_hSegCtx(lIdx * 2), uDesc, 0, 0)
         If lResult = SEC_E_OK Then
-            '--- Find DATA buffer
+            '--- Find DATA buffer and accumulate raw bytes
             Dim j As Long
             For j = 0 To 3
                 If uBuf(j).BufferType = SECBUFFER_DATA And uBuf(j).cbBuffer > 0 Then
                     Dim baDecrypted() As Byte
                     ReDim baDecrypted(0 To uBuf(j).cbBuffer - 1)
                     CopyMemory baDecrypted(0), ByVal uBuf(j).pvBuffer, uBuf(j).cbBuffer
-                    sResult = sResult & pvFromAcpArray(baDecrypted)
+                    pvAppendBuffer baResult, baDecrypted
                 End If
             Next
             '--- Check for EXTRA data
@@ -4592,10 +4683,10 @@ Private Function pvSegTlsDecrypt(ByVal lIdx As Long, baInput() As Byte) As Strin
             Exit Do
         End If
     Loop
-    pvSegTlsDecrypt = sResult
+    pvSegTlsDecryptBytes = baResult
     Exit Function
 EH:
-    pvSegTlsDecrypt = vbNullString
+    pvSegTlsDecryptBytes = vbNullString
 End Function
 
 '=========================================================================

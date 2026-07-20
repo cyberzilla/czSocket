@@ -286,7 +286,7 @@ Private Sub czClient_DataArrival(Index As Integer, ByVal BytesTotal As Long)
             sBody = GetWsClientPage()
             sResp = "HTTP/1.1 200 OK" & vbCrLf
             sResp = sResp & "Content-Type: text/html; charset=utf-8" & vbCrLf
-            sResp = sResp & "Content-Length: " & Len(sBody) & vbCrLf
+            sResp = sResp & "Content-Length: " & LenB(StrConv(sBody, vbFromUnicode)) & vbCrLf
             sResp = sResp & "Connection: close" & vbCrLf
             sResp = sResp & "Server: czSocket/1.1" & vbCrLf
             sResp = sResp & vbCrLf & sBody

@@ -346,7 +346,7 @@ Private Sub czClient_DataArrival(ByVal BytesTotal As Long)
     '--- Build HTTP response
     sResponse = "HTTP/1.1 200 OK" & vbCrLf
     sResponse = sResponse & "Content-Type: " & sContentType & vbCrLf
-    sResponse = sResponse & "Content-Length: " & Len(sBody) & vbCrLf
+    sResponse = sResponse & "Content-Length: " & LenB(StrConv(sBody, vbFromUnicode)) & vbCrLf
     sResponse = sResponse & "Connection: close" & vbCrLf
     sResponse = sResponse & "Server: czSocket/1.1" & vbCrLf
     sResponse = sResponse & vbCrLf & sBody
