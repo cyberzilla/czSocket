@@ -1,7 +1,7 @@
 VERSION 5.00
 Begin VB.Form frmDownloader 
    BorderStyle     =   1  'Fixed Single
-   Caption         =   "czSocket v1.3 Demo - Segmented Downloader && Uploader"
+   Caption         =   "czSocket v1.3.1 Demo - Segmented Downloader && Uploader"
    ClientHeight    =   12000
    ClientLeft      =   120
    ClientTop       =   465
@@ -382,7 +382,7 @@ Attribute VB_Exposed = False
 Option Explicit
 
 '=========================================================================
-' czSocket v1.3 Demo - Segmented Downloader & Uploader
+' czSocket v1.3.1 Demo - Segmented Downloader & Uploader
 '
 ' Features:
 '   - Add multiple download URLs
@@ -968,7 +968,7 @@ Private Sub StartNextDownloads()
                 Log "! Start failed: " & m_tSlots(i).sFileName & " - " & Err.Description
             Else
                 Dim sMode As String
-                If czDl(i).IsSegmented Then
+                If czDl(i).DownloadSegments > 1 Then
                     sMode = " [" & czDl(i).DownloadSegments & " segments]"
                 Else
                     sMode = " [single]"
@@ -1064,7 +1064,7 @@ Private Sub DrawProgress()
             Case DL_COMPLETE
                 picProgress.ForeColor = &H44FF88
                 picProgress.CurrentX = barLeft
-                picProgress.Print Chr$(251);    'checkmark (√)
+                picProgress.Print "*";    '--- complete marker
             Case DL_ERROR
                 picProgress.ForeColor = &H6666FF
                 picProgress.CurrentX = barLeft

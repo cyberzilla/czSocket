@@ -394,6 +394,23 @@ Disconnect          →  WS close frame + TCP close
 All file transfers use streaming I/O with 64KB chunks. Files are never loaded entirely into memory.
 
 ## Changelog
+### v1.3.1
+
+#### Bug Fixes - HTTP Redirect
+- **Fix**: HEAD request during segmented download skipped HTTP redirect (301/302/303/307/308) - now properly follows redirects before starting segments
+- **Fix**: Segment GET requests did not handle redirect responses - added status code parsing and redirect handler per segment
+- **Fix**: Single-connection redirect re-entered segmented download path - m_bSegFallback flag prevents loop
+- **Fix**: FallbackSingle temporarily modified DownloadSegments property causing async corruption - replaced with internal flag
+- **Fix**: Redirect counter not initialized for segmented downloads - reset before pvSegStart
+- **Fix**: pvOnClose destroyed newly created socket after HEAD redirect - replaced socket handle guards with generation counter (m_lSocketGeneration) that reliably detects socket replacement even when OS reuses handle values
+- **Fix**: TLS SEC_I_CONTEXT_EXPIRED handler called pvOnClose after redirect already replaced socket - added generation guard to skip pvOnClose when socket was replaced during data dispatch
+- **Fix**: pvOnClose interfered with newly started segment sockets after HEAD response - HEAD socket now closed explicitly in pvSegOnHeadResponse before creating segments, with generation increment to prevent stale pvOnClose
+
+#### Demo: Downloader
+- **Fix**: Download mode label showed [single] for segmented downloads - IsSegmented checked too early (before async HEAD completes), now uses DownloadSegments property
+- **Fix**: Chr251 displayed as garbled û character in progress bar - replaced with ASCII *
+- **Fix**: Removed stale unicode characters (em-dash, arrows) from source files
+
 ### v1.2
 
 #### Performance

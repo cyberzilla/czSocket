@@ -44,7 +44,7 @@ Attribute VB_PredeclaredId = False
 Attribute VB_Exposed = False
 '=========================================================================
 '
-' czSocket User Control v1.3 (c) 2026
+' czSocket User Control v1.3.1 (c) 2026
 ' Single-file VB6 socket control with full networking support
 ' Inspired by VbAsyncSocket Project (wqweto@gmail.com)
 '
@@ -63,16 +63,16 @@ Attribute VB_Exposed = False
 '   - Chunked file sending with progress, speed, and ETA tracking
 '   - Universal API: auto-detects protocol from URL scheme
 '   - High-performance: 175+ MB/s download, 115+ MB/s upload
-'   - Zero external dependencies — uses only built-in Windows DLLs
+'   - Zero external dependencies - uses only built-in Windows DLLs
 '   - Minimum OS: Windows 7
 '
 ' Required DLLs (all built into Windows):
-'   ws2_32.dll   — WinSock TCP/UDP
-'   secur32.dll  — SSPI/Schannel TLS
-'   advapi32.dll — CryptoAPI (SHA-1, random bytes)
-'   crypt32.dll  — Base64 encode/decode
-'   kernel32.dll — Memory, string conversion, timing
-'   user32.dll   — Window properties (server Accept pattern)
+'   ws2_32.dll   - WinSock TCP/UDP
+'   secur32.dll  - SSPI/Schannel TLS
+'   advapi32.dll - CryptoAPI (SHA-1, random bytes)
+'   crypt32.dll  - Base64 encode/decode
+'   kernel32.dll - Memory, string conversion, timing
+'   user32.dll   - Window properties (server Accept pattern)
 '
 ' This project is licensed under the terms of the MIT license
 '
@@ -80,7 +80,7 @@ Attribute VB_Exposed = False
 ' PUBLIC API REFERENCE
 '=========================================================================
 '
-' METHODS (Universal — auto-detect protocol):
+' METHODS (Universal - auto-detect protocol):
 '   Connect [RemoteHost], [RemotePort]
 '       Connects to a remote host. If RemoteHost contains a URL scheme
 '       (ws://, wss://, http://, https://), protocol is auto-detected.
@@ -157,21 +157,21 @@ Attribute VB_Exposed = False
 '   JsonParseObject(sJsonText) As Object
 '       Stateless parse. Returns Collection (no caching).
 '
-'   JsonStr(sPath) As String     — Get value as String via path.
-'   JsonLng(sPath) As Long       — Get value as Long via path.
-'   JsonDbl(sPath) As Double     — Get value as Double via path.
-'   JsonBool(sPath) As Boolean   — Get value as Boolean via path.
-'   JsonObj(sPath) As Object     — Get sub-object (Collection).
-'   JsonGet(sPath) As Variant    — Get value as Variant via path.
-'   JsonHas(sPath) As Boolean    — Check if key/path exists.
-'   JsonGetKeys([sPath]) As Variant — List keys at path.
+'   JsonStr(sPath) As String     - Get value as String via path.
+'   JsonLng(sPath) As Long       - Get value as Long via path.
+'   JsonDbl(sPath) As Double     - Get value as Double via path.
+'   JsonBool(sPath) As Boolean   - Get value as Boolean via path.
+'   JsonObj(sPath) As Object     - Get sub-object (Collection).
+'   JsonGet(sPath) As Variant    - Get value as Variant via path.
+'   JsonHas(sPath) As Boolean    - Check if key/path exists.
+'   JsonGetKeys([sPath]) As Variant - List keys at path.
 '
-'   JsonSet(sPath, vValue)       — Set/modify value. Auto-create parents.
-'   JsonRemove(sPath)            — Remove key/element from JSON.
+'   JsonSet(sPath, vValue)       - Set/modify value. Auto-create parents.
+'   JsonRemove(sPath)            - Remove key/element from JSON.
 '
-'   JsonDump([Minimize]) As String       — Serialize to JSON string.
-'   JsonDumpPretty([IndentSize]) As String — Pretty-print JSON.
-'   JsonClose()                  — Clear cached JSON data.
+'   JsonDump([Minimize]) As String       - Serialize to JSON string.
+'   JsonDumpPretty([IndentSize]) As String - Pretty-print JSON.
+'   JsonClose()                  - Clear cached JSON data.
 '
 ' EVENTS:
 '   Connect()
@@ -208,27 +208,27 @@ Attribute VB_Exposed = False
 '       Fired on socket or TLS error.
 '
 ' PROPERTIES:
-'   RemoteHost As String     — Remote host name or IP
-'   RemotePort As Long       — Remote port number
-'   RemoteHostIP As String   — (Read-only) Resolved remote IP
-'   LocalPort As Long        — Local port for Bind/Listen
-'   LocalHostName As String  — (Read-only) Local machine name
-'   LocalIP As String        — (Read-only) Local IP address
-'   Protocol As UcsProtocolConstants — sckTCPProtocol / sckUDPProtocol / sckTLSProtocol
-'   State As UcsStateConstants       — (Read-only) Current socket state
-'   SocketHandle As Long     — (Read-only) Raw WinSock handle
-'   Timeout As Long          — Connection timeout in seconds
-'   StatusCode As Long       — (Read-only) Last HTTP response status code
-'   ReadyState As Long       — (Read-only) WebSocket state (0=None,1=Connecting,2=Open,3=Closing)
-'   SockOpt(OptionName, [Level]) — Get/Set raw socket options
-'   DownloadSegments As Long — Number of parallel segments for download (1=single, 2-16=segmented)
-'   IsSegmented As Boolean   — (Read-only) True if current download uses segmented mode
-'   MaxBandwidth As Long     — Max download speed in bytes/sec (0=unlimited)
-'   ProxyHost As String      — HTTP proxy host (empty=direct connection)
-'   ProxyPort As Long        — HTTP proxy port
-'   ProxyUser As String      — Proxy authentication username
-'   ProxyPass As String      — Proxy authentication password
-'   StateAutoSaveInterval As Long — Auto-save state every N seconds (0=disabled)
+'   RemoteHost As String     - Remote host name or IP
+'   RemotePort As Long       - Remote port number
+'   RemoteHostIP As String   - (Read-only) Resolved remote IP
+'   LocalPort As Long        - Local port for Bind/Listen
+'   LocalHostName As String  - (Read-only) Local machine name
+'   LocalIP As String        - (Read-only) Local IP address
+'   Protocol As UcsProtocolConstants - sckTCPProtocol / sckUDPProtocol / sckTLSProtocol
+'   State As UcsStateConstants       - (Read-only) Current socket state
+'   SocketHandle As Long     - (Read-only) Raw WinSock handle
+'   Timeout As Long          - Connection timeout in seconds
+'   StatusCode As Long       - (Read-only) Last HTTP response status code
+'   ReadyState As Long       - (Read-only) WebSocket state (0=None,1=Connecting,2=Open,3=Closing)
+'   SockOpt(OptionName, [Level]) - Get/Set raw socket options
+'   DownloadSegments As Long - Number of parallel segments for download (1=single, 2-16=segmented)
+'   IsSegmented As Boolean   - (Read-only) True if current download uses segmented mode
+'   MaxBandwidth As Long     - Max download speed in bytes/sec (0=unlimited)
+'   ProxyHost As String      - HTTP proxy host (empty=direct connection)
+'   ProxyPort As Long        - HTTP proxy port
+'   ProxyUser As String      - Proxy authentication username
+'   ProxyPass As String      - Proxy authentication password
+'   StateAutoSaveInterval As Long - Auto-save state every N seconds (0=disabled)
 '
 ' ENUMS:
 '   UcsProtocolConstants: sckTCPProtocol=0, sckUDPProtocol=1, sckTLSProtocol=2
@@ -834,6 +834,8 @@ Private Const MAX_REDIRECTS     As Long = 10 '--- Max allowed redirects
 Private m_lDownloadSegments     As Long     '--- Desired segment count (default 4)
 Private m_bSegActive            As Boolean  '--- Segmented download in progress
 Private m_bSegHeadPhase         As Boolean  '--- HEAD request phase
+Private m_bSegFallback          As Boolean  '--- Fallback to single-connection (skip pvSegStart)
+Private m_lSocketGeneration     As Long     '--- Incremented each time a new socket is created (detects replacement)
 Private m_sSegUrl               As String   '--- Target URL
 Private m_sSegSavePath          As String   '--- Final file path
 Private m_sSegExtraHeaders      As String   '--- Extra headers
@@ -902,6 +904,8 @@ Private Const STATE_MAGIC       As String = "CZST"
 Private Sub PrintError(sFunction As String)
     Debug.Print "Critical error: " & Err.Description & " [" & MODULE_NAME & "." & sFunction & "]"
 End Sub
+
+
 
 '=========================================================================
 ' Properties - Design-time
@@ -1709,10 +1713,13 @@ End Sub
 Public Sub Download(Url As String, SavePath As String, Optional ExtraHeaders As String, Optional ByVal ResumeFrom As Long = 0)
     On Error GoTo EH
     '--- NEW: If segments > 1 and not resuming, try segmented download
-    If m_lDownloadSegments > 1 And ResumeFrom = 0 Then
+    '--- Skip if m_bSegFallback is set (server doesn't support Range, avoid re-issuing HEAD)
+    If m_lDownloadSegments > 1 And ResumeFrom = 0 And Not m_bSegFallback Then
+        m_lRedirectCount = 0  '--- Reset redirect counter for new segmented download
         pvSegStart Url, SavePath, ExtraHeaders
         Exit Sub
     End If
+    m_bSegFallback = False  '--- Reset fallback flag after use
     '--- EXISTING: Single connection download (unchanged)
     '--- Add Range header for resume
     Dim sHeaders As String
@@ -1998,6 +2005,7 @@ Private Function pvCreateSocket() As Boolean
         pvSetError LastDllError:=WSAGetLastError(), RaiseError:=True
         Exit Function
     End If
+    m_lSocketGeneration = m_lSocketGeneration + 1
     pvCreateSocket = True
 End Function
 
@@ -2566,10 +2574,17 @@ Private Sub pvTlsProcessReceivedData()
         Case SEC_I_CONTEXT_EXPIRED
             '--- TLS connection closed by peer
             m_lTlsState = TLS_NONE
+            '--- Save generation before dispatching (redirect may replace socket)
+            Dim lTlsCloseGen As Long
+            lTlsCloseGen = m_lSocketGeneration
             '--- Dispatch any pending received data before closing
             If bHasData And pvArraySize(m_baRecvBuffer) > 0 Then
                 pvDispatchReceivedData
                 bHasData = False
+            End If
+            '--- Guard: if socket was replaced during dispatch (redirect), don't close new socket
+            If m_lSocketGeneration <> lTlsCloseGen Then
+                Exit Sub
             End If
             pvOnClose
             Exit Sub
@@ -2743,9 +2758,9 @@ Private Sub tmrPoll_Timer()
     '--- Enumerate events
     Dim uNE As WSANETWORKEVENTS_TYPE
     If WSAEnumNetworkEvents(m_hSocket, m_hEvent, uNE) = SOCKET_ERROR Then Exit Sub
-    '--- Process events (save socket handle to detect replacement mid-processing)
-    Dim hOrigSocket As Long
-    hOrigSocket = m_hSocket
+    '--- Process events (save generation to detect replacement mid-processing)
+    Dim lOrigGeneration As Long
+    lOrigGeneration = m_lSocketGeneration
     If (uNE.lNetworkEvents And FD_CONNECT) <> 0 Then
         If uNE.iErrorCode(FD_CONNECT_BIT) <> 0 Then
             pvSetError LastDllError:=uNE.iErrorCode(FD_CONNECT_BIT)
@@ -2753,27 +2768,31 @@ Private Sub tmrPoll_Timer()
             pvOnConnect
         End If
     End If
-    '--- If socket was replaced (e.g. HEAD→fallback→new Connect), stop processing stale events
-    If m_hSocket <> hOrigSocket Then Exit Sub
+    '--- If socket was replaced (e.g. HEAD->fallback->new Connect), stop processing stale events
+    If m_lSocketGeneration <> lOrigGeneration Then
+        Exit Sub
+    End If
     If (uNE.lNetworkEvents And FD_ACCEPT) <> 0 Then
         If uNE.iErrorCode(FD_ACCEPT_BIT) = 0 Then
             pvOnAccept
         End If
     End If
-    If m_hSocket <> hOrigSocket Then Exit Sub
+    If m_lSocketGeneration <> lOrigGeneration Then Exit Sub
     If (uNE.lNetworkEvents And FD_READ) <> 0 Then
         If uNE.iErrorCode(FD_READ_BIT) = 0 Then
             pvOnReceive
         End If
     End If
-    '--- Guard: if socket changed during pvOnReceive (HEAD→fallback→new socket), bail out
-    If m_hSocket <> hOrigSocket Then Exit Sub
+    '--- Guard: if socket changed during pvOnReceive (HEAD->fallback->new socket), bail out
+    If m_lSocketGeneration <> lOrigGeneration Then
+        Exit Sub
+    End If
     If (uNE.lNetworkEvents And FD_WRITE) <> 0 Then
         If uNE.iErrorCode(FD_WRITE_BIT) = 0 Then
             pvOnSend
         End If
     End If
-    If m_hSocket <> hOrigSocket Then Exit Sub
+    If m_lSocketGeneration <> lOrigGeneration Then Exit Sub
     If (uNE.lNetworkEvents And FD_CLOSE) <> 0 Then
         pvOnClose
     End If
@@ -2816,11 +2835,11 @@ Private Sub pvOnReceive()
     Dim lRecv As Long
     On Error GoTo EH
     '--- Loop to drain all available data (not just one chunk per timer tick)
-    Dim hRecvSocket As Long
-    hRecvSocket = m_hSocket
+    Dim lRecvGeneration As Long
+    lRecvGeneration = m_lSocketGeneration
     Do
-        '--- Guard: if socket was replaced during processing (e.g. HEAD→fallback), stop
-        If m_hSocket <> hRecvSocket Then Exit Do
+        '--- Guard: if socket was replaced during processing (e.g. HEAD->fallback), stop
+        If m_lSocketGeneration <> lRecvGeneration Then Exit Do
         '--- Bandwidth throttling check
         Dim lMaxRecv As Long
         lMaxRecv = RECV_BUFFER_SIZE
@@ -2970,6 +2989,9 @@ Private Sub pvOnClose()
     On Error GoTo EH
     '--- Guard against double-call
     If m_eState = sckClosed Then Exit Sub
+    '--- Save socket generation to detect replacement during processing
+    Dim lCloseGeneration As Long
+    lCloseGeneration = m_lSocketGeneration
     '--- Check for remaining data
     If m_lTlsState = TLS_CONNECTED Then
         '--- Try to read any remaining TLS data
@@ -2984,7 +3006,13 @@ Private Sub pvOnClose()
                 pvTlsProcessReceivedData
                 ReDim baBuffer(0 To RECV_BUFFER_SIZE - 1)
             End If
+            '--- Guard: if socket was replaced during TLS processing, stop
+            If m_lSocketGeneration <> lCloseGeneration Then Exit Do
         Loop While lRecv > 0
+    End If
+    '--- Guard: if socket was replaced during TLS drain, bail out
+    If m_lSocketGeneration <> lCloseGeneration Then
+        Exit Sub
     End If
     '--- Handle active streaming download interrupted by connection close
     If m_bDownloadMode And m_lDownloadFh <> 0 Then
@@ -3003,6 +3031,10 @@ Private Sub pvOnClose()
             m_lHttpState = HTTP_NONE
             pvFireResponse m_lHttpStatus, m_sHttpContentType, m_sHttpBody, m_sHttpHeaders
         End If
+    End If
+    '--- Guard: if socket was replaced during processing (e.g. HEAD->fallback->new Connect), bail out
+    If m_lSocketGeneration <> lCloseGeneration Then
+        Exit Sub
     End If
     m_lHttpState = HTTP_NONE
     m_lWsState = WS_NONE
@@ -3340,8 +3372,43 @@ Private Sub pvHttpProcessResponse()
         If m_bDownloadMode And m_bHttpChunked And m_lHttpContentLength > 0 Then
             m_bHttpChunked = False
         End If
-        '--- HEAD response: fire immediately (no body expected for HEAD)
+        '--- HEAD response: handle redirects first, then fire
         If m_bSegHeadPhase Then
+            '--- Handle HTTP redirects for HEAD requests (301, 302, 303, 307, 308)
+            If (m_lHttpStatus = 301 Or m_lHttpStatus = 302 Or m_lHttpStatus = 303 Or _
+                m_lHttpStatus = 307 Or m_lHttpStatus = 308) Then
+                Dim sHeadLocation As String
+                sHeadLocation = pvHttpGetHeader(sHeaders, "Location")
+                If LenB(sHeadLocation) <> 0 And m_lRedirectCount < MAX_REDIRECTS Then
+                    m_lRedirectCount = m_lRedirectCount + 1
+                    '--- Resolve relative URLs
+                    If Left$(sHeadLocation, 4) <> "http" Then
+                        Dim sHeadBaseScheme As String
+                        If m_eProtocol = sckTLSProtocol Then sHeadBaseScheme = "https" Else sHeadBaseScheme = "http"
+                        If Left$(sHeadLocation, 2) = "//" Then
+                            sHeadLocation = sHeadBaseScheme & ":" & sHeadLocation
+                        ElseIf Left$(sHeadLocation, 1) = "/" Then
+                            sHeadLocation = sHeadBaseScheme & "://" & m_sRemoteHost & sHeadLocation
+                        End If
+                    End If
+                    '--- Clean up current connection state
+                    m_lHttpStatus = 0
+                    m_lHttpState = HTTP_NONE
+                    m_sHttpBody = vbNullString
+                    m_sHttpRawResponse = vbNullString
+                    m_bSegHeadPhase = False
+                    '--- Update segmented download URL and host info for the redirect target
+                    m_sSegUrl = sHeadLocation
+                    pvParseUrl sHeadLocation, sHeadBaseScheme, m_sSegHost, m_lSegPort, m_sSegPath
+                    m_bSegUseTls = (LCase$(sHeadBaseScheme) = "https")
+                    '--- Re-issue HEAD request to the redirect target
+                    pvSegStart m_sSegUrl, m_sSegSavePath, m_sSegExtraHeaders
+                    '--- Ensure timer stays alive for async connect
+                    tmrPoll.Enabled = True
+                    Exit Sub
+                End If
+            End If
+            '--- Non-redirect HEAD: fire response to segmented download handler
             m_lHttpState = HTTP_NONE
             pvFireResponse m_lHttpStatus, m_sHttpContentType, vbNullString, m_sHttpHeaders
             Exit Sub
@@ -3381,6 +3448,8 @@ Private Sub pvHttpProcessResponse()
                     Dim lRedirCount As Long
                     lRedirCount = m_lRedirectCount
                     m_bDownloadMode = False
+                    '--- Keep single-connection mode for redirect (don't re-enter segmented)
+                    m_bSegFallback = True
                     Download sLocation, sRedirSavePath, , lRedirResume
                     m_lRedirectCount = lRedirCount  '--- Preserve redirect counter
                 Else
@@ -4018,6 +4087,18 @@ Private Sub pvSegOnHeadResponse(ByVal lStatus As Long, sHeaders As String)
             m_sSegRecvBuf(i) = vbNullString
             m_baSegTlsPending(i) = Empty
         Next
+        '--- Close HEAD socket before starting segments (prevent pvOnClose from interfering)
+        If m_hSocket <> INVALID_SOCKET And m_hSocket <> 0 Then
+            ws_closesocket m_hSocket
+            m_hSocket = INVALID_SOCKET
+        End If
+        If m_hEvent <> 0 Then
+            WSACloseEvent m_hEvent
+            m_hEvent = 0
+        End If
+        pvTlsCleanup
+        m_lHttpState = HTTP_NONE
+        m_lSocketGeneration = m_lSocketGeneration + 1
         '--- Start all segment connections
         m_bSegActive = True
         m_lSegTotalRecv = 0
@@ -4031,11 +4112,10 @@ Private Sub pvSegOnHeadResponse(ByVal lStatus As Long, sHeaders As String)
     Else
 FallbackSingle:
         '--- Fallback to single connection download
-        Dim lOldSeg As Long
-        lOldSeg = m_lDownloadSegments
-        m_lDownloadSegments = 1
+        '--- Set fallback flag so Download() skips pvSegStart on redirect
+        '--- (avoids re-issuing HEAD when server already told us it doesn't support Range)
+        m_bSegFallback = True
         Download m_sSegUrl, m_sSegSavePath, m_sSegExtraHeaders
-        m_lDownloadSegments = lOldSeg
     End If
     Exit Sub
 EH:
@@ -4285,6 +4365,42 @@ Private Sub pvSegOnReceive(ByVal lIdx As Long)
             Dim lHdrEnd As Long
             lHdrEnd = InStr(m_sSegRawHeader(lIdx), vbCrLf & vbCrLf)
             If lHdrEnd > 0 Then
+                '--- Parse HTTP status code from segment response
+                Dim sSegHeaders As String
+                sSegHeaders = Left$(m_sSegRawHeader(lIdx), lHdrEnd - 1)
+                Dim lSegStatus As Long
+                Dim lSp1 As Long, lSp2 As Long
+                lSp1 = InStr(sSegHeaders, " ")
+                If lSp1 > 0 Then
+                    lSp2 = InStr(lSp1 + 1, sSegHeaders, " ")
+                    If lSp2 > 0 Then lSegStatus = CLng(Mid$(sSegHeaders, lSp1 + 1, lSp2 - lSp1 - 1))
+                End If
+                '--- Handle redirect responses on segments (301, 302, 303, 307, 308)
+                If (lSegStatus = 301 Or lSegStatus = 302 Or lSegStatus = 303 Or _
+                    lSegStatus = 307 Or lSegStatus = 308) Then
+                    Dim sSegLocation As String
+                    sSegLocation = pvHttpGetHeader(sSegHeaders, "Location")
+                    If LenB(sSegLocation) <> 0 Then
+                        '--- Resolve relative redirect URL
+                        If Left$(sSegLocation, 4) <> "http" Then
+                            Dim sSegScheme As String
+                            If m_bSegUseTls Then sSegScheme = "https" Else sSegScheme = "http"
+                            If Left$(sSegLocation, 2) = "//" Then
+                                sSegLocation = sSegScheme & ":" & sSegLocation
+                            ElseIf Left$(sSegLocation, 1) = "/" Then
+                                sSegLocation = sSegScheme & "://" & m_sSegHost & sSegLocation
+                            End If
+                        End If
+                        '--- Abort all segments and restart download to redirect target
+                        pvSegCleanup
+                        m_bSegActive = False
+                        '--- Update URL and re-start segmented download
+                        m_sSegUrl = sSegLocation
+                        pvSegStart m_sSegUrl, m_sSegSavePath, m_sSegExtraHeaders
+                        Exit Sub
+                    End If
+                End If
+                '--- Status OK (2xx/206) - proceed with data
                 m_bSegHeadersDone(lIdx) = True
                 m_sSegRawHeader(lIdx) = vbNullString
                 '--- Extract body bytes from current baDecrypted (avoids lossy round-trip)
